@@ -58,6 +58,60 @@ def _emit(payload: Any) -> None:
     sys.stdout.flush()
 
 
+def _field_names(raw: Any) -> list[str]:
+    """Parse `--fields a,b,c` / `--select a,b,c` into a list of keys."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    names: list[str] = []
+    for chunk in raw:
+        for name in str(chunk).split(","):
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _project(payload: Any, names: list[str]) -> Any:
+    """Keep only `names` from a job dict, or from every job in a list."""
+    if not names:
+        return payload
+    if isinstance(payload, list):
+        return [_project(item, names) for item in payload]
+    if isinstance(payload, dict) and "jobs" in payload and isinstance(payload["jobs"], list):
+        return {
+            "jobs": [_project(item, names) for item in payload["jobs"]],
+            "count": payload.get("count", len(payload["jobs"])),
+        }
+    if not isinstance(payload, dict):
+        return payload
+    return {name: payload.get(name) for name in names}
+
+
+def _print_fields(payload: Any, names: list[str]) -> None:
+    """One line, `key=value` pairs: the cheapest thing for an agent to read."""
+    if isinstance(payload, dict) and "jobs" in payload:
+        for job in payload["jobs"]:
+            print(" ".join(f"{name}={_scalar(job.get(name))}" for name in names))
+        return
+    if isinstance(payload, list):
+        for job in payload:
+            print(" ".join(f"{name}={_scalar(job.get(name))}" for name in names))
+        return
+    print(" ".join(f"{name}={_scalar(payload.get(name))}" for name in names))
+
+
+def _scalar(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item) for item in value)
+    return str(value)
+
+
 def _fail(message: str) -> None:
     sys.stderr.write(f"ajq: {message}\n")
     sys.stderr.flush()
@@ -279,11 +333,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
     job = _job_or_fail(_request({"op": "status", "id": args.id}))
     if not job:
         return 1
+    names = _field_names(args.fields)
+    if names:
+        if args.json:
+            _emit(_project(job, names))
+        else:
+            _print_fields(job, names)
+        return 0
     if args.json:
         _emit(job)
         return 0
     print(f"{job.get('id')}  {_state_of(job)}  {_pool_of(job)}")
-    _print_job_block(job)
+    # the long context (cmd, cwd, serial, signature) is only useful when a human
+    # is reading or the agent is debugging, so it stays behind --verbose
+    if args.verbose:
+        _print_job_block(job)
     out_path = job.get("out_path") or paths.job_out_path(job["id"])
     print(f"out {_bytes(job.get('out_bytes'))} {_tildify(out_path)}")
     return 0
@@ -309,6 +373,16 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not _ok(response):
         return 1
     jobs = response.get("jobs") or []
+    names = _field_names(args.fields)
+    if names:
+        if args.json:
+            _emit(_project({"jobs": jobs, "count": len(jobs)}, names))
+        else:
+            if not jobs:
+                print("no jobs" if not args.state else "no jobs match")
+                return 0
+            _print_fields({"jobs": jobs}, names)
+        return 0
     if args.json:
         # an object, not a bare array, so an agent can add fields later without
         # a breaking change (and so `list --json` matches every other op)
@@ -439,6 +513,13 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     if job is None:
         _fail(f"job {args.id} is not known to the daemon")
         return 2
+    names = _field_names(getattr(args, "fields", None))
+    if names:
+        if args.json:
+            _emit(_project(job, names))
+        else:
+            _print_fields(job, names)
+        return 0 if job.get("state") == "done" else 2
     if args.json:
         _emit(job)
     else:
@@ -779,6 +860,17 @@ def _build_parser() -> argparse.ArgumentParser:
         child.set_defaults(func=func)
         return child
 
+    def add_fields(child: argparse.ArgumentParser) -> None:
+        """`--fields a,b,c` keeps the output small enough for an agent."""
+        child.add_argument(
+            "--fields",
+            "--select",
+            dest="fields",
+            action="append",
+            metavar="A,B,C",
+            help="only these keys, e.g. --fields state,elapsed_s,out_bytes",
+        )
+
     submit = add("submit", "queue a command for the daemon to run", _cmd_submit)
     submit.add_argument("--cwd", help="working directory for the command")
     submit.add_argument("--kind", help="auto|build|test|typecheck|lint|format|install|docker|check")
@@ -820,12 +912,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = add("status", "print one job's state and metadata", _cmd_status)
     status.add_argument("id", help="job id, e.g. j-1a2b3c")
+    add_fields(status)
+    status.add_argument(
+        "-v", "--verbose", action="store_true", help="include cmd, cwd and signature"
+    )
 
     listing = add("list", "queued and running jobs", _cmd_list, aliases=("ls",))
     listing.add_argument("id", nargs="?", help="optional job id to show in full")
     listing.add_argument("--all", action="store_true", help="include terminal jobs")
     listing.add_argument("--state", action="append", metavar="STATE", help="filter by state (repeatable)")
     listing.add_argument("--limit", type=int, default=50, help="max rows (default 50)")
+    add_fields(listing)
 
     output = add("output", "print a job's captured output", _cmd_output, aliases=("logs",))
     output.add_argument("id", help="job id")
@@ -840,6 +937,7 @@ def _build_parser() -> argparse.ArgumentParser:
     wait = add("wait", "block until a job is terminal", _cmd_wait)
     wait.add_argument("id", help="job id")
     wait.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up after S")
+    add_fields(wait)
 
     stats = add("stats", "estimate table and MAPE accuracy", _cmd_stats)
     stats.add_argument("--clear", action="store_true", help="clear all cached estimates")

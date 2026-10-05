@@ -102,8 +102,8 @@ hook, and by `ajq submit`) starts the daemon on demand.
 | Command | Purpose |
 |---|---|
 | `ajq submit [--kind K] [--pool P] [--timeout S] [--priority N] [--serial-key K] [--wait] -- cmd args…` | queue a command (`--shell` to run a shell string) |
-| `ajq status <id> [--json]` | state, queue position, elapsed, ETAs, output path/size, exit code |
-| `ajq list [--all] [--json]` | queued + running (or everything) |
+| `ajq status <id> [--json] [--fields a,b] [-v]` | state, queue position, elapsed, ETAs, output path/size, exit code |
+| `ajq list [--all] [--json] [--fields a,b]` | queued + running (or everything) |
 | `ajq output <id> [--tail N] [--follow] [--from-start]` | the recorded output |
 | `ajq wait <id> [--timeout S]` | block until terminal; exit 0 only for `done` |
 | `ajq cancel <id>` | cancel a queued or running job |
@@ -115,6 +115,27 @@ hook, and by `ajq submit`) starts the daemon on demand.
 | `ajq daemon serve\|ensure\|status\|stop` | daemon control |
 
 `--json` on any command prints the raw daemon response, for agents.
+
+### Cheap polling for agents
+
+`--fields a,b,c` (alias `--select`) prints only the keys you name, so an agent
+never has to pipe `--json` into a `python3 -c` parser:
+
+```console
+$ ajq status j-1a2b --fields state,elapsed_s,out_bytes
+state=running elapsed_s=12.3 out_bytes=4096
+
+$ ajq status j-1a2b --fields state,exit_code --json
+{"exit_code": null, "state": "running"}
+
+$ ajq list --fields id,state,eta_run_s --all
+id=j-1a2b state=running eta_run_s=57.1
+```
+
+`ajq wait` and `ajq list` take `--fields` too. Plain `ajq status <id>` prints
+only state, pool, timing and the output path; `--verbose` adds `cmd`, `cwd` and
+the estimate signature. And use `ajq wait <id>`, not `sleep N` — it blocks
+until the job is terminal and exits 0 only for `done`.
 
 ### States
 

@@ -48,14 +48,16 @@ ajq guard --explain "npm run build"
 ## Reading a job
 
 ```sh
-ajq status <id> --json     # full job dict
-ajq list                   # queued + running
+ajq status <id>             # state, pool, timing, output path
+ajq status <id> --fields state,elapsed_s,out_bytes   # only what you need
+ajq list                    # queued + running
+ajq list --fields id,state,eta_start_s --all        # compact table of everything
 ajq output <id> --tail 80  # captured output
 ajq wait <id>              # block until terminal
 ajq cancel <id>
 ```
 
-Useful keys in the JSON: `state`, `queue_position`, `eta_start_s`, `eta_run_s`,
+Useful keys: `state`, `queue_position`, `elapsed_s`, `eta_start_s`, `eta_run_s`,
 `eta_total_s`, `est_source`, `out_path`, `out_bytes`, `truncated`, `exit_code`,
 `signal`, `kill_reason`. `exit_code` is only meaningful once the state is
 terminal — a queued or running job still carries the zero value `0`.
@@ -86,22 +88,52 @@ Dev servers and watch processes: `ajq submit --pool service -- npm run dev`.
 
 ## Waiting and streaming
 
-Prefer `ajq wait <id>` over `sleep`. To watch a job as it runs:
-`ajq output <id> --follow` (streams until the job is terminal). `--from-start`
-replays the whole log instead of the last 40 lines.
+**Never `sleep` to wait for a job.** `ajq wait <id>` blocks until the job is
+terminal and returns exit 0 only for `done`, so one command replaces the
+sleep-poll-retry loop.
+
+```sh
+ajq wait <id>                    # block, then print the final state
+ajq wait <id> --timeout 300      # give up after 5 minutes
+```
+
+To watch a job while it runs: `ajq output <id> --follow` (streams until the job
+is terminal). `--from-start` replays the whole log instead of the last 40 lines.
+
+## Cheap polling
+
+Do not pipe `--json` into a `python3 -c` parser. Use `--fields a,b,c` (alias
+`--select`), which prints exactly the keys you asked for:
+
+```sh
+ajq status <id> --fields state,elapsed_s,out_bytes
+# state=running elapsed_s=12 out_bytes=4096
+```
+
+With `--json` it emits only those keys as JSON:
+
+```sh
+ajq status <id> --fields state,exit_code --json
+# {"exit_code": null, "state": "running"}
+```
+
+`ajq wait` and `ajq list` take `--fields` too. Useful keys: `state`,
+`queue_position`, `elapsed_s`, `eta_start_s`, `eta_run_s`, `exit_code`,
+`kill_reason`, `out_bytes`, `truncated`. Plain `ajq status <id>` already prints
+only state, pool, timing and the output path; add `--verbose` for `cmd`, `cwd`
+and the signature.
 
 ## End to end
 
 ```sh
 $ ajq submit --label api-tests -- pytest tests/api -q
 j-9f31c0a7d2e4   queued#1   heavy    ...  eta_start 0s  eta_run 1m35s  out 0B
-cmd pytest tests/api -q  kind test  serial /home/me/repo  cwd /home/me/repo
 
-$ ajq status j-9f31c0a7d2e4 --json | head -c 200
-{"state": "running", "elapsed_s": 12.0, "eta_run_s": 95.0, ...}
+$ ajq status j-9f31c0a7d2e4 --fields state,elapsed_s,eta_run_s
+state=running elapsed_s=12 eta_run_s=95
 
-$ ajq wait j-9f31c0a7d2e4
-j-9f31c0a7d2e4  failed  elapsed 1m41s
+$ ajq wait j-9f31c0a7d2e4 --fields state,elapsed_s
+state=failed elapsed_s=101
 $ echo $?
 2
 
