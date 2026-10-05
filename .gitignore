@@ -12,3 +12,5 @@ __pycache__/
 # editor noise
 .DS_Store
 *.swp
+# playwright-cli scratch output (console logs, page snapshots)
+.playwright-cli/

@@ -8,12 +8,14 @@ truncation marker, and the RSS watchdog.
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 import unittest
 
 import helpers
 
+from ajq import platform
 from ajq.backends import get_backend
 from ajq.backends.base import Handle
 from ajq.exec import JobRunner
@@ -118,6 +120,27 @@ class TestJobRunner(helpers.AjqTestCase):
         self.assertEqual(result.kill_reason, "memory_limit")
 
 
+def _user_systemd_available() -> bool:
+    """True when `systemd-run --user` can actually start a scope here.
+
+    CI runners have systemd installed but no user manager, so the cgroup backend
+    cannot be exercised; the POSIX fallback is what runs there.
+    """
+    if not platform.IS_LINUX:
+        return False
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "running" in result.stdout
+
+
 class TestBackends(helpers.AjqTestCase):
     def test_get_backend_auto_is_platform_correct(self):
         from ajq import platform
@@ -139,7 +162,12 @@ class TestBackends(helpers.AjqTestCase):
 
         workdir = tempfile.mkdtemp(prefix="ajq-cwd-", dir=self.state_dir)
 
-        for backend_name in ("posix", "linux"):
+        backends = ["posix"]
+        if _user_systemd_available():
+            backends.append("linux")
+        else:  # no user manager (CI): the cgroup path cannot be exercised
+            print("skipping the systemd backend: no user manager on this host")
+        for backend_name in backends:
             job = make_job(
                 workdir,
                 f"j-cwd-{backend_name}",

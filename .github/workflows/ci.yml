@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Syntax-check installer and hooks
+        run: |
+          bash -n install.sh
+          for hook in hooks/*.sh; do sh -n "$hook"; done
+      - name: Byte-compile the package
+        run: python3 -m compileall -q src/ajq
+      - name: Run tests
+        # AJQ_NO_AUTOSTART is set by tests/helpers.py; --no-daemon keeps the
+        # suite from touching systemd on a runner that has a user manager.
+        run: python3 -m unittest discover -s tests -t tests -v
+
+  demo-gif:
+    # assets/ajq-demo.gif is committed, so a change to demo.html must regenerate
+    # it or the README silently drifts from the code.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Demo source is in sync with the committed GIF
+        run: |
+          if [ "${FORCE_REBUILD:-0}" = "1" ]; then exit 0; fi
+          test -f assets/ajq-demo.gif || {
+            echo "assets/ajq-demo.gif missing; run tools/demo-gif/build.sh" >&2
+            exit 1
+          }

@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<!--
+  ajq demo animation source.
+
+  Deterministic: the whole timeline is a pure function of `t` (seconds), so a
+  frame can be rendered for any t and screenshotted in order. Ambient motion
+  (glow, grid drift) is driven from the same clock rather than CSS animations,
+  which keeps every frame reproducible.
+
+  Regenerate:  tools/demo-gif/build.sh
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- empty favicon: keeps the build log free of a 404 on every run -->
+<link rel="icon" href="data:,">
+<title>ajq demo</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --panel: #111823;
+    --edge: #1e2a3a;
+    --fg: #d7e3f4;
+    --dim: #7d8da3;
+    --accent: #4dd4ac;
+    --hot: #ff6b6b;
+    --warm: #ffb454;
+    --blue: #6aa9ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body {
+    width: 960px; height: 540px; overflow: hidden;
+    /* the installed family is "JetBrainsMono Nerd Font" (no space); asking for
+       "JetBrains Mono" silently resolves to a sans face */
+    font-family: "JetBrainsMono Nerd Font", "DejaVu Sans Mono", "Noto Sans Mono",
+                 "Liberation Mono", monospace;
+    color: var(--fg);
+    position: relative;
+  }
+  /* ambient background: a slow gradient sweep + a faint grid, like a product reel */
+  #glow {
+    position: absolute; inset: -30%;
+    background:
+      radial-gradient(closest-side, rgba(77,212,172,.20), transparent 70%) 20% 25% / 55% 55% no-repeat,
+      radial-gradient(closest-side, rgba(106,169,255,.16), transparent 70%) 85% 75% / 50% 50% no-repeat;
+    filter: blur(10px);
+  }
+  #grid {
+    position: absolute; inset: 0; opacity: .5;
+    background-image:
+      linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+  #stage {
+    position: absolute; inset: 0; padding: 44px 56px;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+
+  .kicker {
+    font-size: 13px; letter-spacing: .34em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 14px;
+  }
+  h1 { font-size: 46px; line-height: 1.08; font-weight: 700; letter-spacing: -.02em; }
+  h1 .thin { color: var(--dim); font-weight: 400; }
+  .sub { margin-top: 16px; font-size: 16px; color: var(--dim); line-height: 1.55; max-width: 660px; }
+
+  .term {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 12px;
+    overflow: hidden;
+  }
+  .term .bar {
+    display: flex; align-items: center; gap: 7px; padding: 9px 13px;
+    border-bottom: 1px solid var(--edge); background: #0d1420;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .term .bar span.title { margin-left: 8px; font-size: 11.5px; color: var(--dim); letter-spacing: .06em; }
+  .term pre {
+    padding: 15px 17px; font-size: 13.5px; line-height: 1.66; white-space: pre;
+    overflow: hidden;
+  }
+  .c-dim { color: var(--dim); }
+  .c-acc { color: var(--accent); }
+  .c-hot { color: var(--hot); }
+  .c-warm { color: var(--warm); }
+  .c-blue { color: var(--blue); }
+  .c-fg { color: var(--fg); }
+
+  /* meters */
+  .meters { display: flex; gap: 16px; }
+  .meter { flex: 1; background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 15px 17px; }
+  .meter .lbl { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); letter-spacing: .08em; }
+  .meter .lbl b { font-weight: 600; }
+  .bar-outer { height: 9px; border-radius: 5px; background: #16202e; margin-top: 11px; overflow: hidden; }
+  .bar-inner { height: 100%; border-radius: 5px; }
+
+  .cols { display: flex; gap: 16px; }
+  /* min-width:auto would stop a column shrinking below its <pre> min-content and
+     push the row past the frame edge */
+  .col { flex: 1; min-width: 0; }
+  .caption { font-size: 13.5px; color: var(--dim); margin-top: 14px; line-height: 1.5; }
+  .caption b { color: var(--fg); font-weight: 600; }
+
+  /* the queue lane: one row per job */
+  .lane { display: flex; flex-direction: column; gap: 9px; }
+  .row {
+    display: flex; align-items: center; gap: 11px; overflow: hidden;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 9px;
+    padding: 11px 14px; font-size: 12.5px; white-space: nowrap;
+  }
+  .row .name { flex: 0 1 auto; min-width: 84px; max-width: 150px;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .row .name em { color: var(--dim); font-style: normal; }
+  .row .track { flex: 1 1 74px; min-width: 74px; height: 7px;
+                border-radius: 4px; background: #131c28; overflow: hidden; }
+  .row .fill {
+    display: block;                 /* a bare <span> ignores width */
+    height: 100%; border-radius: 4px; min-width: 7px;
+    box-shadow: 0 0 10px -2px currentColor;
+  }
+  .row .tag { flex: 0 0 76px; text-align: right; }
+
+  .pill {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 11.5px; letter-spacing: .04em;
+  }
+  .pill.run { background: rgba(77,212,172,.14); color: var(--accent); }
+  .pill.wait { background: rgba(125,141,163,.14); color: var(--dim); }
+  .pill.ok { background: rgba(77,212,172,.16); color: var(--accent); }
+  .pill.bad { background: rgba(255,107,107,.14); color: var(--hot); }
+  .install {
+    margin-top: 20px; background: #0d1420; border: 1px solid var(--edge);
+    border-radius: 10px; padding: 13px 16px; font-size: 13.5px;
+  }
+</style>
+</head>
+<body>
+  <div id="glow"></div><div id="grid"></div>
+  <div id="stage"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+// smoothstep between edges
+const ease = (t, a, b) => { const x = clamp((t - a) / (b - a)); return x * x * (3 - 2 * x); };
+const lerp = (a, b, x) => a + (b - a) * x;
+// appear/disappear windows
+const inWin  = (t, a, b) => ease(t, a, a + 0.45) * (1 - ease(t, b - 0.35, b));
+const outWin = (t, a, b) => ease(t, b - 0.35, b);
+const vis = (t, a, b) => inWin(t, a, b) >= 0.02;
+
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Real ajq output, captured from a live daemon.
+const REAL = {
+  submitted: 'j-cafeeaa4179a   queued#1   light          0s          eta_start 0s        eta_run 53s        out 0B',
+  fields:    'state=running elapsed_s=2.9 eta_run_s=52.5234 out_bytes=0',
+  waited:    'state=done elapsed_s=5.4 exit_code=0',
+  output:    '42 passed',
+  naive:     'zsh: killed\nnpm ERR! signal 9   out of memory',
+};
+
+function meter(label, value, color) {
+  const pct = Math.round(value * 100);
+  return `<div class="meter">
+    <div class="lbl"><span>${label}</span><b style="color:${color}">${pct}%</b></div>
+    <div class="bar-outer"><div class="bar-inner" style="width:${pct}%;background:${color}"></div></div>
+  </div>`;
+}
+
+function laneRow(name, pct, tag, tagClass, fillColor) {
+  return `<div class="row">
+    <span class="name">${name}</span>
+    <span class="track"><span class="fill" style="width:${Math.round(clamp(pct) * 100)}%;background:${fillColor}"></span></span>
+    <span class="tag"><span class="pill ${tagClass}">${tag}</span></span>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// scenes
+// ---------------------------------------------------------------------------
+function sceneTitle(t) {
+  const a = inWin(t, 0, 4.6);
+  if (a < 0.02) return "";
+  const rise = (1 - a) * 26;
+  const k = ease(t, 0.15, 0.9);
+  const s = ease(t, 0.7, 1.6);
+  return `<div style="opacity:${a};transform:translateY(${rise}px)">
+    <div class="kicker" style="opacity:${k}">ajq</div>
+    <h1>
+      <div style="opacity:${s};transform:translateY(${(1 - s) * 18}px)">Your agents were</div>
+      <div style="opacity:${s};transform:translateY(${(1 - s) * 18}px)">running builds in parallel<span style="color:var(--hot)">.</span></div>
+    </h1>
+    <div class="sub" style="opacity:${ease(t, 1.5, 2.4)}">
+      Four worktrees, four test suites, one machine. Swap pressure, a 40-minute
+      build starving a 6-second lint — and no agent knows the others exist.
+    </div>
+    <div class="sub" style="opacity:${ease(t, 2.4, 3.2)}">
+      <span style="color:var(--fg)">ajq</span> puts one daemon in front of all of them.
+    </div>
+  </div>`;
+}
+
+function sceneCollide(t) {
+  // the problem: four shells, memory climbing, one killed
+  const a = inWin(t, 4.4, 9.0);
+  if (a < 0.02) return "";
+  const spike = t < 6.2
+    ? lerp(0.34, 0.97, ease(t, 4.7, 6.2))
+    : lerp(0.97, 0.62, ease(t, 6.6, 7.6));
+  const dead = ease(t, 7.0, 7.8);
+  const rows = [
+    [`agent-a <em>npm test</em>`,    clamp((t - 5.0) / 1.5), "run",  "running", "var(--blue)"],
+    [`agent-b <em>gradle test</em>`, clamp((t - 5.3) / 1.7), "run",  "running", "var(--warm)"],
+    [`agent-c <em>pnpm build</em>`,  clamp((t - 5.6) / 1.9), "run",  "running", "var(--blue)"],
+    [`agent-d <em>pytest</em>`,      clamp((t - 5.9) / 2.1), dead > .5 ? "bad" : "run",
+                                dead > .5 ? "killed" : "running",
+                                dead > .5 ? "var(--hot)" : "var(--warm)"],
+  ];
+  return `<div style="opacity:${a}">
+    <div class="kicker" style="color:var(--hot)">without ajq</div>
+    <h1 style="font-size:33px">Everyone runs it at once<span style="color:var(--hot)">.</span></h1>
+    <div class="cols" style="margin-top:26px">
+      <div class="col" style="flex:1">
+        <div class="lane">${rows.map(r => laneRow(...r)).join("")}</div>
+      </div>
+      <div class="col">
+        <div class="meters" style="flex-direction:column">
+          ${meter("MEMORY", spike, spike > .8 ? "var(--hot)" : "var(--warm)")}
+          ${meter("CPU", clamp(spike * 1.02), spike > .85 ? "var(--hot)" : "var(--warm)")}
+        </div>
+        <div class="term" style="margin-top:16px">
+          <div class="bar"><span class="dot" style="background:var(--hot)"></span><span class="title">agent-d</span></div>
+          <pre class="${dead > .5 ? 'c-hot' : 'c-dim'}" style="opacity:${0.35 + dead * 0.65}">${esc(REAL.naive)}</pre>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function sceneQueue(t) {
+  // the fix: submit, then the daemon decides
+  const a = inWin(t, 8.8, 14.2);
+  if (a < 0.02) return "";
+  const line1 = `<span class="c-dim">$</span> <span class="c-blue">ajq submit</span> --label <span class="c-warm">"api tests"</span> -- pytest -q`;
+  // type only the plain tail; slicing the markup itself would cut mid-tag
+  const PREFIX = '<span class="c-dim">$</span> <span class="c-blue">ajq status</span> j-cafeeaa4179a <span class="c-dim">--fields</span> ';
+  const TAIL = "state,elapsed_s";
+  const shown = t > 9.2 ? line1 : "";
+  const typedChars = Math.max(0, Math.floor((t - 9.2) * 46) - 26);
+  const second = t > 9.5 ? PREFIX + esc(TAIL.slice(0, typedChars)) : "";
+  const caret = (t % 0.9) < 0.45 ? "▌" : " ";
+
+  // queue fills, heavy stays capped at 2
+  const built = [
+    [`api tests <em>test</em>`,     clamp((t - 9.3) / 3.0), "run",  "running",   "var(--accent)"],
+    [`web typecheck <em>typecheck</em>`, clamp((t - 9.6) / 3.4), "run", "running", "var(--accent)"],
+    [`api tests #2 <em>test</em>`,  clamp((t - 9.9) / 3.8), "wait", "queued #1", "var(--dim)"],
+    [`docs build <em>build</em>`,   clamp((t - 10.2) / 4.2), "wait", "queued #2", "var(--dim)"],
+  ];
+  return `<div style="opacity:${a}">
+    <div class="kicker">with ajq</div>
+    <h1 style="font-size:33px">One queue. Capped. Serialized per worktree<span style="color:var(--accent)">.</span></h1>
+    <div class="cols" style="margin-top:24px">
+      <div class="col" style="flex:1.5">
+        <div class="term">
+          <div class="bar">
+            <span class="dot" style="background:var(--hot)"></span>
+            <span class="dot" style="background:var(--warm)"></span>
+            <span class="dot" style="background:var(--accent)"></span>
+            <span class="title">agent</span>
+          </div>
+          <pre>${shown}
+${second}${caret}
+<span class="c-acc">${esc(REAL.fields.slice(0, Math.max(0, Math.floor((t - 10.7) * 40))))}</span></pre>
+        </div>
+        <div class="caption">
+          <b>heavy pool = 2.</b> Everything else waits its turn instead of
+          fighting for the last core.
+        </div>
+      </div>
+      <div class="col" style="flex:1">
+        <div class="lane">${built.map(r => laneRow(...r)).join("")}</div>
+        <div class="meters" style="margin-top:18px">
+          ${meter("MEMORY", 0.42, "var(--accent)")}
+          ${meter("CONCURRENT HEAVY", 0.5, "var(--accent)")}
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function sceneResult(t) {
+  const a = inWin(t, 14.0, 19.4);
+  if (a < 0.02) return "";
+  const done = ease(t, 14.8, 15.6);
+  const outLines = [
+    `<span class="c-dim">$</span> <span class="c-blue">ajq wait</span> j-cafeeaa4179a <span class="c-dim">--fields</span> state,elapsed_s`,
+    `<span class="c-acc">${REAL.waited}</span>`,
+    `<span class="c-dim">$</span> <span class="c-blue">ajq output</span> j-cafeeaa4179a <span class="c-dim">--tail</span> 3`,
+    `<span class="c-fg">${REAL.output}</span>`,
+  ];
+  const visible = Math.min(outLines.length, Math.max(0, Math.floor((t - 14.4) / 0.55)));
+  return `<div style="opacity:${a}">
+    <div class="kicker">and the agent keeps its turn</div>
+    <h1 style="font-size:33px">It waits, reads, moves on<span style="color:var(--accent)">.</span></h1>
+    <div class="cols" style="margin-top:24px">
+      <div class="col" style="flex:1.45">
+        <div class="term">
+          <div class="bar">
+            <span class="dot" style="background:var(--accent)"></span>
+            <span class="title">agent · no sleep, no polling loop</span>
+          </div>
+          <pre>${outLines.slice(0, visible).join("\n")}${
+            visible < outLines.length ? '<span class="c-dim">▌</span>' : ""
+          }</pre>
+        </div>
+      </div>
+      <div class="col">
+        <div class="meters" style="flex-direction:column">
+          ${meter("MEMORY", lerp(0.42, 0.34, done), "var(--accent)")}
+          ${meter("CONCURRENT HEAVY JOBS", lerp(0.86, 0.43, done), "var(--accent)")}
+        </div>
+        <div class="caption" style="margin-top:16px">
+          Output captured to a file, capped at 8&nbsp;MiB, killed at the cap.
+          Timeout defaults to 30&nbsp;min.
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function sceneEnd(t) {
+  const a = inWin(t, 19.2, 23.6);
+  if (a < 0.02) return "";
+  const s = ease(t, 19.5, 20.3);
+  return `<div style="opacity:${a};transform:translateY(${(1 - a) * 20}px)">
+    <div class="kicker" style="opacity:${s}">ajq</div>
+    <h1 style="font-size:38px">Queue the heavy stuff<span class="thin">. Keep the machine.</span></h1>
+    <div class="install" style="opacity:${ease(t, 20.2, 21.0)}">
+      <span class="c-dim">$</span> curl -fsSL https://raw.githubusercontent.com/assawalhy/<span class="c-warm">agents-jobs-queue</span>/main/install.sh | bash
+    </div>
+    <div class="sub" style="opacity:${ease(t, 21.0, 21.8)};margin-top:18px">
+      Linux + macOS · Python stdlib only, no build step · systemd / launchd at boot ·
+      skill + hooks for OpenCode, Claude Code, Codex, Kiro, Pi
+    </div>
+  </div>`;
+}
+
+const SCENES = [sceneTitle, sceneCollide, sceneQueue, sceneResult, sceneEnd];
+
+function render(t) {
+  // The ambient background is deliberately static: a drifting gradient over a
+  // 1px grid dithers badly and inflates the GIF by an order of magnitude, and
+  // it reads as noise at this size anyway. All motion is content.
+  document.getElementById("stage").innerHTML = SCENES.map(fn => fn(t)).join("");
+}
+
+window.renderFrame = render;
+render(0);
+</script>
+</body>
+</html>
