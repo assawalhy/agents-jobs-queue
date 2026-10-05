@@ -429,6 +429,7 @@ class _Server:
             "wait": self._op_wait,
             "stats": self._op_stats,
             "estimates_clear": self._op_estimates_clear,
+            "prune": self._op_prune,
             "shutdown": self._op_shutdown,
         }
 
@@ -806,6 +807,13 @@ class _Server:
     def _op_estimates_clear(self, _payload: dict) -> dict:
         cleared = self.store.clear_estimates()
         return {"ok": True, "cleared": int(cleared or 0)}
+
+    def _op_prune(self, payload: dict) -> dict:
+        keep_days = payload.get("older_than_days")
+        keep_files = bool(payload.get("keep_files", False))
+        days = 14 if keep_days is None else max(0, int(keep_days))
+        removed = self.store.prune(days, remove_files=not keep_files)
+        return {"ok": True, "removed": int(removed or 0), "older_than_days": days}
 
     def _op_shutdown(self, _payload: dict) -> dict:
         self.stop_event.set()

@@ -14,6 +14,7 @@ import unittest
 
 import helpers
 
+from ajq.backends import get_backend
 from ajq.backends.base import Handle
 from ajq.exec import JobRunner
 
@@ -125,6 +126,56 @@ class TestBackends(helpers.AjqTestCase):
         backend = get_backend("auto")
         expected = "linux" if platform.IS_LINUX else "macos"
         self.assertTrue(backend.name.startswith(expected), backend.name)
+
+    def test_child_runs_in_the_jobs_cwd(self):
+        """The job's cwd must reach the child process.
+
+        systemd-run starts the child in the manager's cwd, not ours, so the
+        working directory has to be passed explicitly. Without this the child
+        silently runs in $HOME and every project-scoped command fails.
+        """
+        import json
+        import tempfile
+
+        workdir = tempfile.mkdtemp(prefix="ajq-cwd-", dir=self.state_dir)
+
+        for backend_name in ("posix", "linux"):
+            job = make_job(
+                workdir,
+                f"j-cwd-{backend_name}",
+                [
+                    PY,
+                    "-c",
+                    "import json,os;print(json.dumps({'cwd':os.getcwd()}))",
+                ],
+            )
+            job["cwd"] = workdir
+            try:
+                backend = get_backend(backend_name)
+            except ValueError:
+                self.fail(f"backend {backend_name} unavailable")
+            JobRunner(backend, poll_interval=0.05).run(job, threading.Event())
+            from ajq import paths
+
+            with open(paths.job_out_path(job["id"]), encoding="utf-8") as handle:
+                payload = handle.read()
+            self.assertEqual(
+                json.loads(payload.strip())["cwd"], workdir, f"backend {backend_name}"
+            )
+
+    def test_linux_backend_passes_working_directory(self):
+        import os
+
+        from ajq.backends.linux import LinuxBackend
+
+        backend = LinuxBackend()
+        cwd = self.state_dir
+        command = backend.command({"id": "j-wd", "cwd": cwd}, ["true"])
+        self.assertIn(f"--working-directory={cwd}", command)
+        # an absent or bogus cwd must not produce a broken systemd-run argument
+        for bad in ("", None, "/definitely/not/here"):
+            command = backend.command({"id": "j-wd2", "cwd": bad}, ["true"])
+            self.assertFalse([c for c in command if c.startswith("--working-directory=")])
 
     def test_get_backend_rejects_nonsense(self):
         from ajq.backends import get_backend

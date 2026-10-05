@@ -69,11 +69,21 @@
 - [x] `README.md`: install (Linux + macOS), CLI reference, harness matrix,
       config reference, platform limits
 - [x] example session in the README
-- [x] full test run green: `python3 -m unittest discover -s tests -t tests` → 102 OK
+- [x] full test run green: `python3 -m unittest discover -s tests -t tests` → 107 OK
 - [x] manual end-to-end on this machine: real systemd unit, cgroup-scoped jobs,
       timeout kill (`signal 15`), output capture, 2-worktree serialization
       (one job per worktree in parallel, queued within each)
 - [x] live install verified against the real herdr + plannotator configs
+
+## Post-release fixes (v0.1.1)
+- [x] **critical:** the Linux backend never passed the job's cwd to the child, so
+      every job ran in `$HOME` under `systemd-run --user --scope`; project-scoped
+      commands failed with e.g. "Script not found". Fixed with
+      `--working-directory=`, plus a test that asserts the child's real cwd
+      through both backends (the POSIX backend always honoured it, which is why
+      the suite missed it)
+- [x] `ajq prune` to delete finished jobs and their captured output
+      (`--older-than`, `--all`, `--keep-files`, `--yes`)
 
 ## Known gaps (deliberate, documented)
 - macOS has no hard per-process RAM cap; the admission gate plus an RSS watchdog

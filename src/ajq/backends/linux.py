@@ -204,6 +204,12 @@ class LinuxBackend:
         props.append("OOMPolicy=stop")
         command = ["systemd-run", "--user", "--scope", "--quiet",
                    f"--unit={unit_for(str(job.get('id', '')))}"]
+        # systemd-run starts the child in the *manager's* cwd (the user's home),
+        # not ours, so the job's cwd has to be passed explicitly or every job
+        # silently runs in $HOME.
+        cwd = job.get("cwd")
+        if isinstance(cwd, str) and cwd and os.path.isdir(cwd):
+            command += [f"--working-directory={cwd}"]
         for prop in props:
             command += ["-p", prop]
         return [*command, *limits["extra_args"], "--", *payload]

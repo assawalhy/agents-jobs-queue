@@ -112,6 +112,41 @@ class TestStore(helpers.AjqTestCase):
         self.assertIsNone(self.store.get(old["id"]))
         self.assertIsNotNone(self.store.get(recent["id"]))
 
+    def test_prune_removes_output_files_too(self):
+        from ajq import paths
+
+        old = self.store.add_job(argv=["a"], cwd=self.state_dir)
+        paths.ensure_dir(paths.job_dir(old["id"]))
+        with open(paths.job_out_path(old["id"]), "w", encoding="utf-8") as handle:
+            handle.write("log output")
+        self.store.finish(old["id"], "done", exit_code=0)
+        self.store.update(old["id"], ended_at=time.time() - 60 * 60 * 24 * 30)
+        self.assertEqual(self.store.prune(keep_days=1), 1)
+        self.assertFalse(os.path.exists(paths.job_out_path(old["id"])))
+        self.assertFalse(os.path.exists(paths.job_dir(old["id"])))
+
+    def test_prune_can_keep_files(self):
+        from ajq import paths
+
+        old = self.store.add_job(argv=["a"], cwd=self.state_dir)
+        paths.ensure_dir(paths.job_dir(old["id"]))
+        with open(paths.job_out_path(old["id"]), "w", encoding="utf-8") as handle:
+            handle.write("keep me")
+        self.store.finish(old["id"], "done", exit_code=0)
+        self.store.update(old["id"], ended_at=time.time() - 60 * 60 * 24 * 30)
+        self.assertEqual(self.store.prune(keep_days=1, remove_files=False), 1)
+        self.assertTrue(os.path.exists(paths.job_out_path(old["id"])))
+
+    def test_prune_never_touches_running_or_queued_jobs(self):
+        queued = self.store.add_job(argv=["a"], cwd=self.state_dir)
+        running = self.store.add_job(argv=["b"], cwd=self.state_dir)
+        self.store.start(running["id"], pid=3, backend="b")
+        self.store.update(queued["id"], enqueued_at=0.0)
+        self.store.update(running["id"], started_at=1.0)
+        self.assertEqual(self.store.prune(keep_days=0, remove_files=False), 0)
+        self.assertIsNotNone(self.store.get(queued["id"]))
+        self.assertIsNotNone(self.store.get(running["id"]))
+
     def test_exit_code_is_null_until_the_job_ends(self):
         """A queued job reporting exit_code 0 reads as "it passed"."""
         job = self.store.add_job(argv=["a"], cwd=self.state_dir)

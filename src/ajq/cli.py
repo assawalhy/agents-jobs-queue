@@ -465,6 +465,37 @@ def _row_sigma(row: dict) -> float:
     return 0.0
 
 
+def _cmd_prune(args: argparse.Namespace) -> int:
+    """Delete finished jobs (and their output) so the queue stays readable."""
+    days = 0 if args.delete_all else max(0, int(args.older_than_days))
+    if not args.json and not args.yes:
+        what = "every finished job" if args.delete_all else f"finished jobs older than {days}d"
+        files = "" if args.keep_files else " and their captured output"
+        try:
+            answer = input(f"delete {what}{files}? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("cancelled")
+            return 0
+    response = _request(
+        {
+            "op": "prune",
+            "older_than_days": days,
+            "keep_files": bool(args.keep_files),
+        }
+    )
+    if not _ok(response):
+        return 1
+    if args.json:
+        _emit(response)
+        return 0
+    removed = int(response.get("removed") or 0)
+    scope = "all finished jobs" if args.delete_all else f"older than {days}d"
+    print(f"removed {removed} job(s) {scope}" + ("" if args.keep_files else " and their output"))
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     if args.clear:
         response = _request({"op": "estimates_clear"})
@@ -764,6 +795,28 @@ def _build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--wait", action="store_true", help="block until the job is terminal")
     submit.add_argument("--wait-timeout", dest="wait_timeout", type=float, metavar="S", help="give up waiting after S")
     submit.add_argument("command", nargs="+", help="command to run, after --")
+
+    prune = add("prune", "delete old finished jobs and their captured output", _cmd_prune)
+    prune.add_argument(
+        "--older-than",
+        dest="older_than_days",
+        type=int,
+        default=14,
+        metavar="DAYS",
+        help="delete finished jobs older than DAYS (default 14)",
+    )
+    prune.add_argument(
+        "--all",
+        dest="delete_all",
+        action="store_true",
+        help="delete every finished job regardless of age",
+    )
+    prune.add_argument(
+        "--keep-files",
+        action="store_true",
+        help="keep each job's out.log/meta.json on disk",
+    )
+    prune.add_argument("--yes", action="store_true", help="do not ask for confirmation")
 
     status = add("status", "print one job's state and metadata", _cmd_status)
     status.add_argument("id", help="job id, e.g. j-1a2b3c")

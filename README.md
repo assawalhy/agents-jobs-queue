@@ -108,6 +108,7 @@ hook, and by `ajq submit`) starts the daemon on demand.
 | `ajq wait <id> [--timeout S]` | block until terminal; exit 0 only for `done` |
 | `ajq cancel <id>` | cancel a queued or running job |
 | `ajq stats [--clear]` | estimate table with per-signature MAPE |
+| `ajq prune [--older-than D\|--all] [--keep-files] [--yes]` | delete finished jobs and their captured output |
 | `ajq guard --explain "<cmd>"` | why a command is heavy/light, and the `ajq` equivalent |
 | `ajq config [--print-default\|--seed\|--force-config]` | inspect or seed the config |
 | `ajq doctor` | backend, socket, unit state, linger, memory, guard mode |
@@ -239,7 +240,7 @@ runs `sh -c` unless you pass `--shell`.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t tests   # 102 tests, no daemon required
+python3 -m unittest discover -s tests -t tests   # 107 tests, no daemon required
 ./install.sh --dry-run --all                     # preview an install
 ```
 

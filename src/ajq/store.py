@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -568,13 +569,31 @@ class Store:
             return [dict(row) for row in rows]
 
     # -- housekeeping -----------------------------------------------------
-    def prune(self, keep_days: int = 14) -> int:
-        """Drop terminal job rows older than keep_days; output files are untouched."""
+    def prune(self, keep_days: int = 14, remove_files: bool = True) -> int:
+        """Drop terminal job rows older than keep_days.
+
+        With remove_files the per-job directory (out.log, meta.json) goes too,
+        otherwise the queue is cleaned but the disk keeps filling up.
+        """
         cutoff = time.time() - max(0, int(keep_days)) * 86400.0
         marks = ",".join("?" for _ in TERMINAL_STATES)
         with self._lock:
-            return self._write(
+            doomed = [
+                row["id"]
+                for row in self._conn.execute(
+                    f"SELECT id FROM jobs WHERE state IN ({marks})"
+                    " AND COALESCE(ended_at, 0.0) > 0.0 AND ended_at < ?",
+                    tuple(TERMINAL_STATES) + (cutoff,),
+                ).fetchall()
+            ]
+            if not doomed:
+                return 0
+            removed = self._write(
                 f"DELETE FROM jobs WHERE state IN ({marks})"
                 " AND COALESCE(ended_at, 0.0) > 0.0 AND ended_at < ?",
                 tuple(TERMINAL_STATES) + (cutoff,),
             )
+        if remove_files:
+            for job_id in doomed:
+                shutil.rmtree(paths.job_dir(job_id), ignore_errors=True)
+        return removed
