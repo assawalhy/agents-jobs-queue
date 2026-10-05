@@ -1,0 +1,14 @@
+# runtime state and job output
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+.venv/
+# installer output (the built zipapp lands in ~/.local/bin; anchor the pattern
+# so the src/ajq/ package is NOT ignored)
+/ajq
+*.zip
+# editor noise
+.DS_Store
+*.swp

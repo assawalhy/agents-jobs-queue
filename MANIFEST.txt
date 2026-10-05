@@ -1,0 +1,16 @@
+# ajq file manifest
+# format: <repo-relative-path>|<version_added>|<version_removed>
+# version_removed is "-" while the file is still shipped. Uninstall/update still
+# cleans up a removed file from every target it was ever installed to.
+#
+# Per-harness overlay files live under harnesses/<id>/. hooks/* is installed once
+# into the canonical runtime prefix ($XDG_DATA_HOME/ajq) and referenced by
+# absolute path from every harness, so one copy serves all of them.
+#
+hooks/ajq-ensure.sh|0.1.0|-
+hooks/ajq-session-start.sh|0.1.0|-
+hooks/ajq-pre-tool-use.sh|0.1.0|-
+skills/ajq/SKILL.md|0.1.0|-
+harnesses/opencode/ajq.js|0.1.0|-
+harnesses/pi/ajq.ts|0.1.0|-
+harnesses/kiro/ajq.json.in|0.1.0|-

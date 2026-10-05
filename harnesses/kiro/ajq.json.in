@@ -1,0 +1,24 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "ajq ensure",
+      "trigger": "SessionStart",
+      "action": {
+        "type": "command",
+        "command": "sh \"@AJQ_BIN_HOOKS@/ajq-session-start.sh\" kiro",
+        "timeout": 5
+      }
+    },
+    {
+      "name": "ajq heavy-task guard",
+      "trigger": "PreToolUse",
+      "matcher": "Bash",
+      "action": {
+        "type": "command",
+        "command": "sh \"@AJQ_BIN_HOOKS@/ajq-pre-tool-use.sh\" kiro",
+        "timeout": 5
+      }
+    }
+  ]
+}
