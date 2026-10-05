@@ -42,15 +42,45 @@ Every override is available per submit (`--timeout`, `--max-output-bytes`,
 
 ## Install
 
+One line, no clone, nothing left behind:
+
 ```bash
-git clone <this repo> ~/Projects/agents-jobs-queue
-cd ~/Projects/agents-jobs-queue
-./install.sh --all            # CLI + boot service + skill + hooks
+curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | bash
+```
+
+That fetches the payload into a temp directory, installs, and cleans up after
+itself. It needs `python3` (3.11+); `git` is used to fetch when present and an
+HTTPS tarball otherwise.
+
+```bash
 ajq doctor                    # check what got installed
 ```
 
-`install.sh` also takes `--target opencode,claude,codex,pi,kiro`, `--no-daemon`,
-`--dry-run`, `--force-config`, and `--uninstall [--purge]`.
+Useful variants:
+
+```bash
+# pinned to a tag instead of main
+curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | AJQ_VERSION=v0.1.0 bash
+
+# only the CLI and integrations, no boot service (no linger, no systemd/launchd)
+curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | bash -s -- --no-daemon
+
+# pick harnesses
+curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | bash -s -- --target claude,codex
+
+# uninstall
+curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | bash -s -- --uninstall
+```
+
+`install.sh` also accepts `--dry-run`, `--force-config` and `--uninstall --purge`
+(deletes job history and the estimate cache too).
+
+From a checkout:
+
+```bash
+git clone https://github.com/assawalhy/agents-jobs-queue.git
+cd agents-jobs-queue && ./install.sh --all
+```
 
 What it installs:
 
@@ -209,7 +239,7 @@ runs `sh -c` unless you pass `--shell`.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t tests   # 98 tests, no daemon required
+python3 -m unittest discover -s tests -t tests   # 102 tests, no daemon required
 ./install.sh --dry-run --all                     # preview an install
 ```
 

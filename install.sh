@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ajq installer — jobs-queue daemon for heavy agent tasks.
 #
+# One-line install (no clone, nothing left behind):
+#   curl -fsSL https://raw.githubusercontent.com/assawalhy/agents-jobs-queue/main/install.sh | bash
+#
 # Installs:
 #   * the `ajq` CLI as a stdlib-only zipapp (no build step, no dependencies)
 #   * the daemon as a systemd user unit (Linux) or a launchd agent (macOS),
@@ -12,10 +15,19 @@
 #
 # Usage: ./install.sh [--all|--target a,b] [--no-daemon] [--uninstall]
 #                     [--purge] [--force-config] [--dry-run] [--help]
+#
+# Environment:
+#   AJQ_REPO_URL   source repo for the piped form (default: the GitHub repo below)
+#   AJQ_VERSION    git ref to install (default: main); pin it to a tag
+#   AJQ_FETCH      auto|git|tarball — how the piped form gets its payload
+#   AJQ_UNINSTALL  set to 1 with the piped form to uninstall
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORIG_ARGS=("$@")
+# piped into bash there is no script file, so BASH_SOURCE is unset under `set -u`
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)" || SCRIPT_DIR="$PWD"
 MANIFEST="$SCRIPT_DIR/MANIFEST.txt"
 PLUGIN="ajq"
 # must match the config default (daemon.unit) in src/ajq/config.py
@@ -49,6 +61,86 @@ warn() { printf '  ! %s\n' "$*" >&2; }
 run()  { [ "$DRY_RUN" = 1 ] && { printf '    would run: %s\n' "$*"; return 0; }; "$@"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# ---- piped-install bootstrap ------------------------------------------------
+# `curl … | bash` gives us install.sh and nothing else, so fetch the payload
+# (src/, skills/, hooks/, harnesses/, MANIFEST.txt) into a temp dir and re-exec
+# the real installer from there. Nothing is left behind afterwards.
+REPO_SLUG="assawalhy/agents-jobs-queue"
+REPO_URL="${AJQ_REPO_URL:-https://github.com/$REPO_SLUG.git}"
+REF="${AJQ_VERSION:-main}"
+FETCH="${AJQ_FETCH:-auto}"
+
+fetch_payload() {
+  local dest="$1"
+  command -v git >/dev/null 2>&1 || return 1
+  log "  fetching $REPO_URL ($REF)"
+  git clone --quiet --depth 1 --single-branch --branch "$REF" "$REPO_URL" "$dest" 2>/dev/null || return 1
+  return 0
+}
+
+fetch_tarball() {
+  local dest="$1" url dir
+  url="https://codeload.github.com/$REPO_SLUG/tar.gz/$REF"
+  [ -n "${AJQ_TARBALL_URL:-}" ] && url="$AJQ_TARBALL_URL"
+  local tmp; tmp="$(mktemp -d)"
+  log "  fetching $url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp/payload.tgz" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp/payload.tgz" "$url" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  else
+    rm -rf "$tmp"; return 1
+  fi
+  tar xzf "$tmp/payload.tgz" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  # a GitHub codeload tarball has a top-level directory, `git archive` does not
+  local src=""
+  if [ -f "$tmp/install.sh" ]; then
+    src="$tmp"
+  else
+    src="$(dirname "$(find "$tmp" -maxdepth 2 -name install.sh -type f 2>/dev/null | head -1)")"
+    [ -n "$src" ] && [ "$src" != "." ] || { rm -rf "$tmp"; return 1; }
+  fi
+  mv "$src" "$dest" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  return 0
+}
+
+bootstrap() {
+  # already inside a checkout, or already bootstrapped: nothing to fetch
+  [ -z "${AJQ_BOOTSTRAPPED:-}" ] || return 1
+  [ -f "$SCRIPT_DIR/$MANIFEST_REL" ] && return 1
+
+  local stage; stage="$(mktemp -d)"
+  # the value is interpolated now: `stage` is a function local and would be gone
+  # (and unbound under set -u) by the time an EXIT trap fires
+  trap "rm -rf '$stage'" EXIT INT TERM
+  local dest="$stage/$PLUGIN"
+  local ok=1
+  case "$FETCH" in
+    git)     fetch_payload "$dest" || ok=0 ;;
+    tarball) fetch_tarball "$dest" || ok=0 ;;
+    *)       fetch_payload "$dest" || fetch_tarball "$dest" || ok=0 ;;
+  esac
+  if [ "$ok" != 1 ] || [ ! -f "$dest/install.sh" ]; then
+    rm -rf "$stage"
+    cat >&2 <<EOF
+error: could not fetch the ajq installer payload from
+       $REPO_URL ($REF)
+  * private repo? git needs access: ssh -T git@github.com, or set GITHUB_TOKEN
+  * pinned a tag that does not exist? unset AJQ_VERSION
+  * offline? clone by hand, then run: ./install.sh $*
+EOF
+    exit 1
+  fi
+  log "  fetched $(du -sh "$dest" 2>/dev/null | cut -f1) of payload"
+  AJQ_BOOTSTRAPPED=1 bash "$dest/install.sh" "${ORIG_ARGS[@]}"
+  local rc=$?
+  rm -rf "$stage"
+  exit $rc
+}
+
+MANIFEST_REL="MANIFEST.txt"
+
 usage() {
   # the header comment block, up to the first blank line
   sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -63,6 +155,9 @@ Options:
   --force-config   overwrite an existing ~/.config/ajq/config.json
   --dry-run        print what would happen, change nothing
   --help           this message
+
+Uninstall a piped install with:
+  curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh | bash -s -- --uninstall
 EOF
 }
 
@@ -615,6 +710,10 @@ do_uninstall() {
 
 main() {
   local mode=install targets=""
+  # `AJQ_UNINSTALL=1 curl … | bash` needs no extra flags
+  [ "${AJQ_UNINSTALL:-0}" = "1" ] && mode=uninstall
+  # fetch our own payload when this script was piped in; a no-op in a checkout
+  bootstrap || true
   while [ $# -gt 0 ]; do
     case "$1" in
       install|uninstall|--install) mode="install" ;;

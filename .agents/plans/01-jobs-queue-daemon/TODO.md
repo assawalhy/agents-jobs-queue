@@ -50,6 +50,9 @@
 - [x] uninstall removes unit/plist, hook entries, files, registry; `--purge` for state
 - [x] tests: fake-HOME install preserves herdr + plannotator entries; uninstall
       clean; merge idempotent; unit uses absolute python
+- [x] piped install: `curl … | bash` self-bootstraps its payload (git clone, then
+      HTTPS tarball), no clone required, temp dir cleaned up, no-op in a checkout,
+      actionable error when the repo is unreachable
 
 ## M4 harness integrations
 - [x] `skills/ajq/SKILL.md` (when to submit, flags, per-state actions, example)
@@ -66,7 +69,7 @@
 - [x] `README.md`: install (Linux + macOS), CLI reference, harness matrix,
       config reference, platform limits
 - [x] example session in the README
-- [x] full test run green: `python3 -m unittest discover -s tests -t tests` → 98 OK
+- [x] full test run green: `python3 -m unittest discover -s tests -t tests` → 102 OK
 - [x] manual end-to-end on this machine: real systemd unit, cgroup-scoped jobs,
       timeout kill (`signal 15`), output capture, 2-worktree serialization
       (one job per worktree in parallel, queued within each)

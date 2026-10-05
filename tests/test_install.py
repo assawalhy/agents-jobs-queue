@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -214,6 +216,123 @@ class TestJsonMerge(InstallerCase):
         self.assertEqual(self.ajq_commands(payload, "PreToolUse"), [])
         self.assertIn("herdr-agent-state.sh", " ".join(self.commands_in(payload, "SessionStart")))
         self.assertEqual(payload["permissions"], HERDR_CLAUDE["permissions"])
+
+
+class TestPipedInstall(InstallerCase):
+    """`curl … | bash` must fetch its own payload and leave nothing behind.
+
+    Simulated with a bare directory holding only install.sh, piped into bash,
+    and a file:// URL for the repo (the same shape as a real git clone).
+    """
+
+    def pipe(self, source_dir, *args, env_extra=None):
+        env = dict(self.env)
+        env.update(env_extra or {})
+        return subprocess.run(
+            ["bash", "-s", "--", *args],
+            input=pathlib.Path(source_dir, "install.sh").read_text(encoding="utf-8"),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=source_dir,
+        )
+
+    def test_piped_install_fetches_its_own_payload(self):
+        bare = tempfile.mkdtemp(prefix="ajq-bare-")
+        self.addCleanup(shutil.rmtree, bare, True)
+        shutil.copy2(INSTALL, pathlib.Path(bare, "install.sh"))
+        self.assertEqual(
+            sorted(os.listdir(bare)), ["install.sh"], "the bare dir must start empty"
+        )
+        result = self.pipe(
+            bare,
+            "--no-daemon",
+            "--target",
+            "claude",
+            env_extra={"AJQ_REPO_URL": f"file://{REPO}", "AJQ_FETCH": "git"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fetching", result.stdout)
+        home = pathlib.Path(self.home)
+        self.assertTrue((home / ".local/bin/ajq").exists())
+        self.assertTrue((home / ".local/share/ajq/hooks/ajq-ensure.sh").exists())
+        self.assertTrue((home / ".claude/skills/ajq/SKILL.md").exists())
+        self.assertEqual(
+            sorted(os.listdir(bare)), ["install.sh"], "the bare dir must be left clean"
+        )
+
+    def test_piped_install_tarball_path(self):
+        bare = tempfile.mkdtemp(prefix="ajq-bare-")
+        self.addCleanup(shutil.rmtree, bare, True)
+        shutil.copy2(INSTALL, pathlib.Path(bare, "install.sh"))
+        archive = pathlib.Path(tempfile.mkdtemp(prefix="ajq-tgz-"), "ajq.tgz")
+        self.addCleanup(shutil.rmtree, archive.parent, True)
+        subprocess.run(
+            ["git", "archive", "--format=tar.gz", "-o", str(archive), "HEAD"],
+            cwd=REPO,
+            check=True,
+            capture_output=True,
+        )
+        server = subprocess.Popen(
+            # -u: the port line goes to a pipe, so it must not sit in a buffer
+            [sys.executable, "-u", "-m", "http.server", "0", "--bind", "127.0.0.1"],
+            cwd=archive.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.addCleanup(server.terminate)
+        # http.server prints the port it bound; read it instead of guessing
+        port = ""
+        for _ in range(100):
+            line = server.stdout.readline()
+            if not line:
+                break
+            match = re.search(r"port (\d+)", line)
+            if match:
+                port = match.group(1)
+                break
+        self.assertTrue(port, "test http server never reported its port")
+        result = self.pipe(
+            bare,
+            "--no-daemon",
+            "--target",
+            "claude",
+            env_extra={
+                "AJQ_FETCH": "tarball",
+                "AJQ_TARBALL_URL": f"http://127.0.0.1:{port}/ajq.tgz",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fetching", result.stdout)
+        self.assertTrue((pathlib.Path(self.home) / ".local/bin/ajq").exists())
+
+    def test_bootstrap_is_a_noop_inside_a_checkout(self):
+        result = subprocess.run(
+            ["bash", str(INSTALL), "--dry-run", "--no-daemon", "--target", "claude"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=REPO,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("fetching", result.stdout)
+        self.assertIn("would install", result.stdout)
+
+    def test_unreachable_repo_reports_actionable_error(self):
+        bare = tempfile.mkdtemp(prefix="ajq-bare-")
+        self.addCleanup(shutil.rmtree, bare, True)
+        shutil.copy2(INSTALL, pathlib.Path(bare, "install.sh"))
+        result = self.pipe(
+            bare,
+            "--no-daemon",
+            env_extra={"AJQ_REPO_URL": "file:///nonexistent-ajq-repo", "AJQ_FETCH": "git"},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not fetch", result.stderr)
+        self.assertIn("clone by hand", result.stderr)
 
 
 class TestUninstall(InstallerCase):
