@@ -174,6 +174,17 @@ class TestWaitTail(helpers.AjqTestCase):
         args = cli._build_parser().parse_args(["wait", "j-x", "-n", "3"])
         self.assertEqual(args.tail, 3)
 
+    def test_tail_count_accepts_scientific_notation(self):
+        import argparse
+
+        from ajq import cli
+
+        self.assertEqual(cli._tail_count("80"), 80)
+        self.assertEqual(cli._tail_count("4e+24"), 1_000_000)  # capped
+        self.assertEqual(cli._tail_count("-5"), 0)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            cli._tail_count("nope")
+
     def test_job_tail_reads_the_last_lines(self):
         from ajq import cli
 

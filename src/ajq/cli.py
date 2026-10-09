@@ -849,6 +849,23 @@ def _cmd_version(args: argparse.Namespace) -> int:
 # -- parser ---------------------------------------------------------------
 
 
+def _tail_count(value: str) -> int:
+    """`--tail` line count. Accepts `80`, `4e+24` or `1.5e3`; never negative.
+
+    A model can pass a scientific-notation or absurd tail while trying to read
+    output; parse it instead of failing (argparse's `int` rejects `4e+24`), and
+    cap it so the slice stays sane.
+    """
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        try:
+            count = int(float(value))
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"invalid tail: {value!r}") from None
+    return max(0, min(count, 1_000_000))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ajq",
@@ -945,7 +962,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     output = add("output", "print a job's captured output", _cmd_output, aliases=("logs",))
     output.add_argument("id", help="job id")
-    output.add_argument("--tail", type=int, default=40, metavar="N", help="last N lines (default 40)")
+    output.add_argument("--tail", type=_tail_count, default=40, metavar="N", help="last N lines (default 40)")
     output.add_argument("--follow", "-f", action="store_true", help="stream until the job is terminal")
     output.add_argument("--from-start", action="store_true", help="show the whole log, not the tail")
     output.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up following after S")
@@ -959,7 +976,7 @@ def _build_parser() -> argparse.ArgumentParser:
     wait.add_argument(
         "--tail",
         "-n",
-        type=int,
+        type=_tail_count,
         default=0,
         metavar="N",
         help="also print the last N lines of output (one call: state + log)",

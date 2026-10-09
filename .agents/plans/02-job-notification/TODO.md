@@ -6,8 +6,9 @@
 
 ## M2 plugin
 - [x] `ajq.js`: `ajq_wait` tool (id, tail, timeout) — in-process, returns state + tail
-- [x] `ajq.js`: clamp `ajq_status.tail` (max 1000) so a runaway tail cannot read the whole log
-- [x] plugin tests: `ajq_wait`, the clamp, tool registration
+- [x] `ajq.js`: `ajq_status` is state-only (no log); `ajq_output` (id, tail, clamped) reads the log
+- [x] `cli.py`: `--tail` accepts `4e+24`/floats and caps, so a runaway tail cannot crash it
+- [x] plugin tests: `ajq_wait`, `ajq_output` + clamp, status is state-only, tool registration
 
 ## M3 guidance
 - [x] `SKILL.md`: background `ajq wait --tail`; never sleep, never poll `ajq_status`
