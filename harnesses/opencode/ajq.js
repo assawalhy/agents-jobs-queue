@@ -206,8 +206,9 @@ function withNote(result, note) {
 const SUBMIT_DESCRIPTION =
   "Queue a heavy command (build, test, typecheck, lint, install, docker build, or anything " +
   "expected to take more than ~30s) on the ajq jobs daemon instead of running it in the shell. " +
-  "Call this whenever the next step would otherwise be a slow bash command. Returns the job id; " +
-  "follow it with ajq_wait (or a background `ajq wait`).";
+  "Call this whenever the next step would otherwise be a slow bash command. A cheap job is waited " +
+  "out and returns its state and log in this same call; anything longer returns the job id to " +
+  "follow with ajq_wait (or a background `ajq wait`).";
 
 const STATUS_DESCRIPTION =
   "Read an ajq job's state only (queued/running/done/failed/timeout/canceled/lost). It does not " +
@@ -250,11 +251,23 @@ async function sessionDirectory(ctx, context) {
   return text(ctx && ctx.location && ctx.location.directory);
 }
 
+// Seconds `ajq_submit` will block for a cheap job before handing the id back.
+// Long enough to cover a lint/format/check, short enough that a real build never
+// sits inside a blocking tool call. `wait_s: 0` opts out.
+const SUBMIT_WAIT_S = 20;
+const SUBMIT_WAIT_MAX_S = 120;
+
+function clampWaitS(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return value === 0 || raw === 0 ? 0 : SUBMIT_WAIT_S;
+  return Math.min(Math.trunc(raw), SUBMIT_WAIT_MAX_S);
+}
+
 async function runSubmit(ctx, args, context) {
   try {
     const command = text(args.command);
     if (command === "") return { content: "ajq_submit: command is required" };
-    const cliArgs = ["submit"];
+    const cliArgs = ["--json", "submit"];
     if (text(args.label) !== "") cliArgs.push("--label", text(args.label));
     if (text(args.kind) !== "") cliArgs.push("--kind", text(args.kind));
     if (Number(args.timeout) > 0) cliArgs.push("--timeout", String(Math.trunc(Number(args.timeout))));
@@ -266,8 +279,32 @@ async function runSubmit(ctx, args, context) {
     // --shell hands the single string to $SHELL in the daemon, so pipes, &&,
     // globs and env prefixes behave the way the model wrote them.
     cliArgs.push("--shell", "--", command);
-    const out = text(await spawn(cliArgs, CLI_MS));
-    return { content: out === "" ? `ajq_submit: no output from ajq for ${command}` : out };
+    const waitS = clampWaitS(args.wait_s);
+    // JSON carries the id and the daemon's estimate, so the id never has to be
+    // scraped back out of the human line and the wait can be gated on it.
+    const raw = text(await spawn(cliArgs, CLI_MS));
+    let job = null;
+    try {
+      job = JSON.parse(raw);
+    } catch {
+      job = null;
+    }
+    if (!job || !job.id) {
+      // The job is already queued; never submit twice. Hand back whatever the
+      // CLI printed so the id can still be read out of it.
+      return { content: raw === "" ? `ajq_submit: no output from ajq for ${command}` : raw };
+    }
+    const etaTotal = Number(job.eta_start_s) + Number(job.eta_run_s);
+    if (waitS > 0 && Number.isFinite(etaTotal) && etaTotal <= waitS) {
+      const waited = text(
+        await spawnText(["wait", String(job.id), "--tail", "40", "--timeout", String(waitS)], (waitS + 15) * 1000),
+      );
+      // `ajq wait` already leads with the id; do not print it twice.
+      if (waited !== "") {
+        return { content: waited.startsWith(String(job.id)) ? waited : `${job.id}  ${waited}` };
+      }
+    }
+    return { content: `${job.id}  state ${text(job.state)}  pool ${text(job.pool)}  eta_run ${Math.round(Number(job.eta_run_s))}s` };
   } catch (err) {
     return { content: `ajq_submit failed: ${err && err.message ? err.message : String(err)}` };
   }
@@ -334,6 +371,12 @@ function submitInput() {
         description: "build | test | typecheck | lint | format | install | docker | check. Omit for auto.",
       },
       timeout: { type: "number", description: "Seconds before the job is killed. Omit for the config default." },
+      wait_s: {
+        type: "number",
+        description:
+          "Seconds to wait for a cheap job and return its state and log in this same call " +
+          `(default ${SUBMIT_WAIT_S}, max ${SUBMIT_WAIT_MAX_S}, 0 to return the id immediately).`,
+      },
       label: { type: "string", description: "Short name shown by `ajq list`." },
       priority: { type: "number", description: "Higher runs first inside a pool." },
     },

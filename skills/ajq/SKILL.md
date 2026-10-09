@@ -113,6 +113,12 @@ The old reflex — `sleep 115` — exists only because a *shell* call is SIGTERM
 - **OpenCode's `ajq_wait` tool**: the same wait in-process (state + tail, not the
   shell's 120 s timeout). Good for a job that finishes within a turn; for a long
   one, background `ajq wait` instead.
+- **OpenCode's `ajq_submit` tool already does this for cheap jobs.** It waits up to
+  `wait_s` (default 20, max 120) when the daemon's own estimate says the job will be
+  over inside that budget, and returns the state and log in the same call — no
+  `ajq_wait` follow-up. A job estimated longer, or one sitting behind others in the
+  queue (`eta_start_s`), comes back as an id to follow with `ajq_wait`. Pass
+  `wait_s: 0` to always get the id immediately.
 
 In OpenCode, `ajq_status` returns **state only** — no log. That is deliberate, so a
 running job cannot be polled for output. Read the log with `ajq_output`, or get
