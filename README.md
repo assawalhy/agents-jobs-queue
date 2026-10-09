@@ -53,7 +53,7 @@ flowchart LR
 | Piece | Invoke | What it does |
 | --- | --- | --- |
 | `ajq submit` | `ajq submit -- pytest -q` | Queue a command; returns a job id, not a hang |
-| `ajq wait` | `ajq wait <id>` | Block until terminal; exit 0 only for `done` |
+| `ajq wait` | `ajq wait <id> --tail 80` | Block until terminal; one call returns the final state and the log; exit 0 only for `done` |
 | `ajq status` | `ajq status <id> --fields state,elapsed_s` | State, queue position, ETAs, output size — only the keys you ask for |
 | `ajq output` | `ajq output <id> --follow` | The captured output, tailable and streamable |
 | `ajq stats` | `ajq stats` | Estimate cache with real MAPE accuracy per signature |

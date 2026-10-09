@@ -508,11 +508,25 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _job_tail(job: dict, count: int) -> list[str]:
+    """The last `count` lines of a job's captured output, or [] when absent."""
+    if not count or count <= 0:
+        return []
+    out_path = job.get("out_path") or paths.job_out_path(str(job.get("id") or ""))
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    return lines[-count:]
+
+
 def _cmd_wait(args: argparse.Namespace) -> int:
     job = _wait_for(args.id, args.timeout_s)
     if job is None:
         _fail(f"job {args.id} is not known to the daemon")
         return 2
+    tail = _job_tail(job, getattr(args, "tail", 0))
     names = _field_names(getattr(args, "fields", None))
     if names:
         if args.json:
@@ -521,11 +535,16 @@ def _cmd_wait(args: argparse.Namespace) -> int:
             _print_fields(job, names)
         return 0 if job.get("state") == "done" else 2
     if args.json:
-        _emit(job)
+        payload = dict(job)
+        if tail:
+            payload["tail"] = tail
+        _emit(payload)
     else:
         print(f"{job.get('id')}  {_state_of(job)}  elapsed {_short(job.get('elapsed_s'))}")
         if job.get("kill_reason"):
             print(f"kill_reason {job['kill_reason']}")
+        for line in tail:
+            print(line)
     return 0 if job.get("state") == "done" else 2
 
 
@@ -830,6 +849,23 @@ def _cmd_version(args: argparse.Namespace) -> int:
 # -- parser ---------------------------------------------------------------
 
 
+def _tail_count(value: str) -> int:
+    """`--tail` line count. Accepts `80`, `4e+24` or `1.5e3`; never negative.
+
+    A model can pass a scientific-notation or absurd tail while trying to read
+    output; parse it instead of failing (argparse's `int` rejects `4e+24`), and
+    cap it so the slice stays sane.
+    """
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        try:
+            count = int(float(value))
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"invalid tail: {value!r}") from None
+    return max(0, min(count, 1_000_000))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ajq",
@@ -926,7 +962,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     output = add("output", "print a job's captured output", _cmd_output, aliases=("logs",))
     output.add_argument("id", help="job id")
-    output.add_argument("--tail", type=int, default=40, metavar="N", help="last N lines (default 40)")
+    output.add_argument("--tail", type=_tail_count, default=40, metavar="N", help="last N lines (default 40)")
     output.add_argument("--follow", "-f", action="store_true", help="stream until the job is terminal")
     output.add_argument("--from-start", action="store_true", help="show the whole log, not the tail")
     output.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up following after S")
@@ -937,6 +973,14 @@ def _build_parser() -> argparse.ArgumentParser:
     wait = add("wait", "block until a job is terminal", _cmd_wait)
     wait.add_argument("id", help="job id")
     wait.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up after S")
+    wait.add_argument(
+        "--tail",
+        "-n",
+        type=_tail_count,
+        default=0,
+        metavar="N",
+        help="also print the last N lines of output (one call: state + log)",
+    )
     add_fields(wait)
 
     stats = add("stats", "estimate table and MAPE accuracy", _cmd_stats)
