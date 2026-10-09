@@ -46,7 +46,7 @@ ajq guard --explain "npm run build"
 | `--serial-key auto\|none\|NAME` | `auto` (default) serializes by git worktree so two agents in one worktree never overlap. `none` opts out; a name groups unrelated dirs. |
 | `--shell` | run through `$SHELL`; needed for pipes, `&&`, globs, and env prefixes. |
 | `--wait` | block until the job is terminal, then print it. Convenient for a quick job; for anything slow, submit then background `ajq wait <id> --tail N`. |
-| `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. |
+| `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. A full `typecheck + coverage` run outgrows the default 2 GB — give it `--memory-mb 12288`, or raise `resources.memory_mb` and restart the daemon. |
 | `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. |
 
 ## Reading a job
