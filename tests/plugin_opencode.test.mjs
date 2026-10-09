@@ -48,7 +48,8 @@ case "$cmd" in
     [ -n "\${STUB_LIST:-}" ] && printf '%s\\n' "\${STUB_LIST}" ;;
   submit) printf 'j-test123\\n' ;;
   status) printf '{"state":"running"}\\n' ;;
-  output) printf 'some log output\\n' ;;
+  output) printf 'output-args: %s\\n' "$*" ;;
+  wait) printf 'state done\\nlog line one\\nlog line two\\n' ;;
 esac
 exit 0
 `,
@@ -116,7 +117,7 @@ test("setup registers the native tools", async () => {
   const { tools } = await load("warn");
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["ajq_status", "ajq_submit"],
+    ["ajq_status", "ajq_submit", "ajq_wait"],
   );
 });
 
@@ -182,7 +183,22 @@ test("ajq_status reads state and output", async () => {
   const status = tools.find((t) => t.name === "ajq_status");
   const out = await status.execute({ id: "j-test123" }, {});
   assert.match(out.content, /state running/);
-  assert.match(out.content, /some log output/);
+  assert.match(out.content, /output-args:/);
+});
+
+test("ajq_status clamps a runaway tail", async () => {
+  const { tools } = await load("warn");
+  const status = tools.find((t) => t.name === "ajq_status");
+  const out = await status.execute({ id: "j-test123", tail: 99999999999999 }, {});
+  assert.match(out.content, /--tail 1000\b/);
+});
+
+test("ajq_wait returns the final state and log in one call", async () => {
+  const { tools } = await load("warn");
+  const wait = tools.find((t) => t.name === "ajq_wait");
+  const out = await wait.execute({ id: "j-test123", tail: 2 }, {});
+  assert.match(out.content, /state done/);
+  assert.match(out.content, /log line two/);
 });
 
 test("the queue snapshot is injected once", async () => {
