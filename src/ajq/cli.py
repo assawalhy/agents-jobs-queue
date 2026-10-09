@@ -508,11 +508,25 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _job_tail(job: dict, count: int) -> list[str]:
+    """The last `count` lines of a job's captured output, or [] when absent."""
+    if not count or count <= 0:
+        return []
+    out_path = job.get("out_path") or paths.job_out_path(str(job.get("id") or ""))
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    return lines[-count:]
+
+
 def _cmd_wait(args: argparse.Namespace) -> int:
     job = _wait_for(args.id, args.timeout_s)
     if job is None:
         _fail(f"job {args.id} is not known to the daemon")
         return 2
+    tail = _job_tail(job, getattr(args, "tail", 0))
     names = _field_names(getattr(args, "fields", None))
     if names:
         if args.json:
@@ -521,11 +535,16 @@ def _cmd_wait(args: argparse.Namespace) -> int:
             _print_fields(job, names)
         return 0 if job.get("state") == "done" else 2
     if args.json:
-        _emit(job)
+        payload = dict(job)
+        if tail:
+            payload["tail"] = tail
+        _emit(payload)
     else:
         print(f"{job.get('id')}  {_state_of(job)}  elapsed {_short(job.get('elapsed_s'))}")
         if job.get("kill_reason"):
             print(f"kill_reason {job['kill_reason']}")
+        for line in tail:
+            print(line)
     return 0 if job.get("state") == "done" else 2
 
 
@@ -937,6 +956,14 @@ def _build_parser() -> argparse.ArgumentParser:
     wait = add("wait", "block until a job is terminal", _cmd_wait)
     wait.add_argument("id", help="job id")
     wait.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up after S")
+    wait.add_argument(
+        "--tail",
+        "-n",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also print the last N lines of output (one call: state + log)",
+    )
     add_fields(wait)
 
     stats = add("stats", "estimate table and MAPE accuracy", _cmd_stats)

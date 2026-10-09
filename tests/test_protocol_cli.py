@@ -156,5 +156,60 @@ class TestCli(helpers.AjqTestCase):
         self.assertNotIn("Traceback", err.getvalue())
 
 
+class TestWaitTail(helpers.AjqTestCase):
+    def _write_log(self, job_id, body):
+        from ajq import paths
+
+        paths.ensure_dir(paths.job_dir(job_id))
+        out = paths.job_out_path(job_id)
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        return out
+
+    def test_parser_accepts_tail(self):
+        from ajq import cli
+
+        args = cli._build_parser().parse_args(["wait", "j-x", "--tail", "5"])
+        self.assertEqual(args.tail, 5)
+        args = cli._build_parser().parse_args(["wait", "j-x", "-n", "3"])
+        self.assertEqual(args.tail, 3)
+
+    def test_job_tail_reads_the_last_lines(self):
+        from ajq import cli
+
+        job_id = "j-waittail"
+        out = self._write_log(job_id, "a\nb\nc\nd\n")
+        job = {"id": job_id, "out_path": out}
+        self.assertEqual(cli._job_tail(job, 2), ["c", "d"])
+        self.assertEqual(cli._job_tail(job, 0), [])
+        self.assertEqual(cli._job_tail({"id": "j-missing"}, 3), [])
+
+    def test_wait_tail_prints_state_and_log(self):
+        import argparse
+        import contextlib
+        import io
+
+        from ajq import cli
+
+        job_id = "j-waittail2"
+        out = self._write_log(job_id, "l1\nl2\nl3\n")
+        job = {"id": job_id, "state": "failed", "elapsed_s": 1.0, "out_path": out}
+        saved = cli._wait_for
+        cli._wait_for = lambda _id, _timeout: job
+        try:
+            args = argparse.Namespace(id=job_id, timeout_s=None, tail=2, json=False, fields=None)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cli._cmd_wait(args)
+        finally:
+            cli._wait_for = saved
+        self.assertEqual(code, 2)  # a non-`done` state exits 2
+        printed = buffer.getvalue()
+        self.assertIn("failed", printed)
+        self.assertIn("l2", printed)
+        self.assertIn("l3", printed)
+        self.assertNotIn("l1", printed)
+
+
 if __name__ == "__main__":
     unittest.main()

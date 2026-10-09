@@ -131,12 +131,12 @@ case "$command" in
         ;;
 esac
 suggest="ajq submit $tail"
-note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Then check it with 'ajq status <id> --json', block on it with 'ajq wait <id>', and read the captured output with 'ajq output <id>'."
+note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Then wait for it with 'ajq wait <id> --tail 80' — background that call so the session stays interactive; it returns the final state and the log in one call. Do not sleep or poll."
 
 if [ "$mode" = "block" ]; then
     # Never deny a tool call on a machine whose queue is not answering.
     run "$ajq" daemon status >/dev/null 2>&1 || exit 0
-    reason="Blocked by ajq (hooks.guard_mode=block): '$command' is classified ${kind} (heavy). Submit it instead: ajq submit --label <name> [--timeout <seconds>] [--max-output-bytes <n>] $tail — then inspect it with 'ajq status <id> --json' and 'ajq output <id>'."
+    reason="Blocked by ajq (hooks.guard_mode=block): '$command' is classified ${kind} (heavy). Submit it instead: ajq submit --label <name> [--timeout <seconds>] [--max-output-bytes <n>] $tail — then wait for it with 'ajq wait <id> --tail 80' (background that call; one call returns the final state and the log)."
     esc="$(json_string "$reason")"
     case "$HARNESS" in
         kiro)

@@ -28,7 +28,7 @@ Every guard is overridable per submit (`--timeout`, `--max-output-bytes`,
 | `ajq status <id> [--json] [--fields a,b] [-v]` | State, queue position, elapsed, ETAs, output path and size, exit code |
 | `ajq list [--all] [--json] [--fields a,b]` | Queued + running, or everything |
 | `ajq output <id> [--tail N] [--follow] [--from-start]` | The recorded output |
-| `ajq wait <id> [--timeout S] [--fields a,b]` | Block until terminal; exit 0 only for `done` |
+| `ajq wait <id> [--tail N] [--timeout S] [--fields a,b]` | Block until terminal; `--tail` prints the last N log lines so one call returns state + log; exit 0 only for `done` |
 | `ajq cancel <id>` | Cancel a queued or running job |
 | `ajq stats [--clear]` | Estimate table with per-signature MAPE |
 | `ajq guard --explain "<cmd>"` | Why a command is heavy or light, and the `ajq` equivalent |
@@ -41,7 +41,6 @@ Every guard is overridable per submit (`--timeout`, `--max-output-bytes`,
 
 `--fields a,b,c` (alias `--select`) prints only the keys you name, so an agent
 never needs to pipe `--json` into a `python3 -c` parser:
-
 ```console
 $ ajq status j-1a2b --fields state,elapsed_s,out_bytes
 state=running elapsed_s=12.3 out_bytes=4096
@@ -56,7 +55,8 @@ id=j-1a2b state=running eta_run_s=57.1
 Unknown keys come back as `null` rather than vanishing, so a typo is visible
 instead of silently returning nothing. Plain `ajq status <id>` prints only
 state, pool, timing and the output path; `--verbose` adds `cmd`, `cwd` and the
-estimate signature. Use `ajq wait <id>`, not `sleep N`.
+estimate signature. Use `ajq wait <id> --tail N` (background it for a slow job),
+not `sleep N`.
 
 ### States
 
@@ -116,7 +116,7 @@ backend and says so rather than implying parity.
 
 | Harness | Skill | Hooks | Tool guard |
 | --- | --- | --- | --- |
-| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` tools |
+| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` / `ajq_wait` tools |
 | Claude Code | yes | `SessionStart` + `PreToolUse Bash` in `settings.json` | yes |
 | Codex | yes | `SessionStart` + `PreToolUse Bash` in `hooks.json` | yes |
 | Kiro | yes | `~/.kiro/hooks/ajq.json` (`SessionStart`, `PreToolUse`) | yes |

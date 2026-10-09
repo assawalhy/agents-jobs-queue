@@ -41,7 +41,7 @@ ajq guard --explain "npm run build"
 | `--priority N` | higher runs first inside a pool. Use it to unblock a job the user is waiting on. |
 | `--serial-key auto\|none\|NAME` | `auto` (default) serializes by git worktree so two agents in one worktree never overlap. `none` opts out; a name groups unrelated dirs. |
 | `--shell` | run through `$SHELL`; needed for pipes, `&&`, globs, and env prefixes. |
-| `--wait` | block until the job is terminal, then print it. Convenient for a quick job; prefer submit-then-poll for anything slow. |
+| `--wait` | block until the job is terminal, then print it. Convenient for a quick job; for anything slow, submit then background `ajq wait <id> --tail N`. |
 | `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. |
 | `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. |
 
@@ -88,14 +88,27 @@ Dev servers and watch processes: `ajq submit --pool service -- npm run dev`.
 
 ## Waiting and streaming
 
-**Never `sleep` to wait for a job.** `ajq wait <id>` blocks until the job is
-terminal and returns exit 0 only for `done`, so one command replaces the
-sleep-poll-retry loop.
+**Never `sleep`, and never poll `ajq status` in a loop.** One call gets the result:
 
 ```sh
-ajq wait <id>                    # block, then print the final state
+ajq wait <id> --tail 80          # final state + the last 80 log lines, one call
 ajq wait <id> --timeout 300      # give up after 5 minutes
 ```
+
+`ajq wait` blocks until the job is terminal, prints the final state, then the
+`--tail` lines, and exits 0 only for `done` (2 otherwise). That replaces the
+`wait` + `output` pair and the `| grep` half of a poll.
+
+The old reflex — `sleep 115` — exists only because a *shell* call is SIGTERMed at
+~120 s. Two ways around it, both without polling:
+
+- **Background the wait** (preferred for a slow job). Launch `ajq wait <id> --tail 80`
+  as a background task: it returns immediately, the session stays interactive, and
+  you are resumed with the output when the job ends. OpenCode: the shell tool's
+  background mode. Claude Code: `run_in_background`.
+- **OpenCode's `ajq_wait` tool**: the same wait in-process (state + tail, not the
+  shell's 120 s timeout). Good for a job that finishes within a turn; for a long
+  one, background `ajq wait` instead.
 
 To watch a job while it runs: `ajq output <id> --follow` (streams until the job
 is terminal). `--from-start` replays the whole log instead of the last 40 lines.
