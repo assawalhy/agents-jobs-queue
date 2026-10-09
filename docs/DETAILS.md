@@ -140,6 +140,13 @@ tool result after the command runs, while `block` denies the call before it runs
 `hooks.guard_mode` is read lazily (10 s cache), so a config change lands without
 restarting OpenCode.
 
+`ajq_submit` submits with `--json` and reads the daemon's own `eta_start_s` and
+`eta_run_s`: when the job is expected to be over inside `wait_s` (default 20 s,
+max 120, `0` disables) it waits and returns the final state plus the log tail in
+that one call, so a cheap lint or check never needs an `ajq_wait` follow-up.
+Anything longer — or a job still queued behind others — comes back as the job id.
+The cost is one extra ~30 ms `ajq` spawn per submit.
+
 JSON files the installer does not own are **merged, never rewritten**: only
 entries carrying an ajq marker are removed and re-added, so hooks from other
 tools (herdr, plannotator, …) and every unrelated setting survive install,
