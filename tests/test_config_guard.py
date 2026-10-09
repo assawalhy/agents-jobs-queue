@@ -142,6 +142,18 @@ class TestGuard(unittest.TestCase):
         self.assertFalse(guard.is_heavy_command("ls -la"))
         self.assertFalse(guard.is_heavy_command('echo "unbalanced ( quote'))
 
+    def test_read_only_command_chain_is_light(self):
+        """A `&&` chain of read-only git/echo must never be treated as heavy."""
+        command = (
+            "cd /work/tree && git log --oneline -4 && echo '--- status ---' "
+            "&& git status --short && git rev-parse --abbrev-ref HEAD "
+            "&& git rev-list --left-right --count origin/main...HEAD"
+        )
+        self.assertFalse(guard.is_heavy_command(command))
+        verdict = guard.classify(command.split())
+        self.assertEqual(verdict["kind"], "check")
+        self.assertFalse(verdict["heavy"])
+
     def test_explain_mentions_the_recommended_command(self):
         text = guard.explain(["npm", "run", "build"])
         self.assertIn("ajq", text)
