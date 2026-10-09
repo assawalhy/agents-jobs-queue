@@ -116,7 +116,7 @@ backend and says so rather than implying parity.
 
 | Harness | Skill | Hooks | Tool guard |
 | --- | --- | --- | --- |
-| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` | yes, plus native `ajq_submit` / `ajq_status` tools |
+| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` tools |
 | Claude Code | yes | `SessionStart` + `PreToolUse Bash` in `settings.json` | yes |
 | Codex | yes | `SessionStart` + `PreToolUse Bash` in `hooks.json` | yes |
 | Kiro | yes | `~/.kiro/hooks/ajq.json` (`SessionStart`, `PreToolUse`) | yes |
@@ -128,16 +128,23 @@ the queue snapshot, and on `PreToolUse` for Bash they classify the command and
 point the agent at `ajq submit`. A hook never blocks when the daemon is
 unreachable or when the command already goes through `ajq`.
 
+The OpenCode plugin targets the **V2 plugin API** (OpenCode `2.0.26`): V2 calls
+the default export's `setup(ctx)` and ignores a V1 `server()`, so all logic lives
+in `setup`. It hooks the `shell` tool (V1 called it `bash`; both are accepted).
+Because V2 has no per-tool context channel, `warn` there appends the note to the
+tool result after the command runs, while `block` denies the call before it runs.
+`hooks.guard_mode` is read lazily (10 s cache), so a config change lands without
+restarting OpenCode.
+
 JSON files the installer does not own are **merged, never rewritten**: only
 entries carrying an ajq marker are removed and re-added, so hooks from other
 tools (herdr, plannotator, …) and every unrelated setting survive install,
 update and uninstall. A backup is written first and the result is validated
 before it replaces the original.
 
-Known integration limits: OpenCode v2.0.18 does not dispatch
-`tui.toast.show` (the plugin logs instead), and the `pi` binary in use is a Go
-port with no JavaScript extension loader, so the pi extension only takes effect
-on the Node build — the skill covers pi either way.
+Known integration limits: the `pi` binary in use is a Go port with no JavaScript
+extension loader, so the pi extension only takes effect on the Node build — the
+skill covers pi either way.
 
 ## Configuration
 
@@ -205,5 +212,4 @@ rebuilding produces the same GIF; no CSS keyframe animations are involved.
 - macOS has no hard per-process RAM cap; the admission gate plus an RSS watchdog
   is the protection. `ajq doctor` states this.
 - Kilo / Kimi / DeepSeek / Cursor get the skill but no hooks.
-- OpenCode v2.0.18 does not dispatch `tui.toast.show`; the plugin logs instead.
 - The `pi` binary in use is a Go port without a JS extension loader.
