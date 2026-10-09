@@ -21,8 +21,12 @@ ajq submit --cwd ../other-worktree -- cargo build
 
 Keep running these directly — they are milliseconds and the queue adds nothing:
 
-`git status` / `diff` / `log`, `rg`, `grep`, `ls`, `cat`, `head`, `tail`, `jq`,
-`wc`, `find`, `echo`, `pwd`, `which`.
+`git status` / `diff` / `log` / `show` / `branch` / `rev-parse` / `rev-list`,
+`rg`, `grep`, `ls`, `cat`, `head`, `tail`, `jq`, `wc`, `find`, `echo`, `pwd`,
+`which` — and any `&&` chain built only from these.
+
+Never wrap a read-only command in `ajq submit`: the guard classifies it as
+`check` (light) and the queue adds nothing.
 
 Not sure how a command is classified?
 
