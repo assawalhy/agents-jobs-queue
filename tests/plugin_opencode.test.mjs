@@ -26,6 +26,7 @@ function makeStub() {
     bin,
     `#!/usr/bin/env bash
 cmd="\${1:-}"; shift || true
+if [ "\$cmd" = "--json" ]; then cmd="\${1:-}"; shift || true; fi
 case "$cmd" in
   config)
     if [ "\${1:-}" = "--json" ]; then
@@ -46,7 +47,8 @@ case "$cmd" in
     fi ;;
   list)
     [ -n "\${STUB_LIST:-}" ] && printf '%s\\n' "\${STUB_LIST}" ;;
-  submit) printf 'j-test123\\n' ;;
+  submit)
+    printf '{"id":"j-test123","state":"queued","pool":"light","eta_start_s":%s,"eta_run_s":%s}\\n' "\${STUB_ETA_START:-0}" "\${STUB_ETA_RUN:-2}" ;;
   status) printf '{"state":"running"}\\n' ;;
   output)
     if [ -n "\${STUB_OUTPUT_EMPTY:-}" ]; then exit 0; else printf 'output-args: %s\\n' "$*"; fi ;;
@@ -175,8 +177,42 @@ test("the V1 tool name 'bash' is still accepted", async () => {
 test("ajq_submit runs submit with the session directory", async () => {
   const { tools } = await load("warn");
   const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm test", wait_s: 0 }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+});
+
+test("ajq_submit returns state and log in one call for a cheap job", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint" }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.match(out.content, /state done/);
+  assert.match(out.content, /log line two/);
+});
+
+test("ajq_submit hands back the id without waiting for a slow job", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "600" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
   const out = await submit.execute({ command: "npm test" }, { sessionID: "ses_x" });
   assert.match(out.content, /j-test123/);
+  assert.match(out.content, /eta_run 600s/);
+  assert.doesNotMatch(out.content, /log line two/);
+});
+
+test("ajq_submit does not wait on a job that is still queued behind others", async () => {
+  const { tools } = await load("warn", { STUB_ETA_START: "300", STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint" }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.doesNotMatch(out.content, /state done/);
+});
+
+test("ajq_submit wait_s 0 opts out of waiting", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint", wait_s: 0 }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.doesNotMatch(out.content, /state done/);
 });
 
 test("ajq_status returns state only, never the log", async () => {
