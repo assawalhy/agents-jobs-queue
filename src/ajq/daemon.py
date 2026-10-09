@@ -464,7 +464,10 @@ class _Server:
         self._write_pidfile()
         self.config = load_config()
         wanted = str(self.config.get("resources.backend") or "auto")
-        self.backend = get_backend(wanted)
+        # The config must reach the backend: without it the cgroup MemoryMax falls
+        # back to DEFAULT_MEMORY_MB and `resources.memory_mb` only ever sizes the
+        # admission check, never the job.
+        self.backend = get_backend(wanted, self.config)
         self.backend_name = str(getattr(self.backend, "name", wanted))
         self.runner = JobRunner(self.backend)
         self.scheduler = Scheduler(self.store, self.config, self.runner, self.backend)

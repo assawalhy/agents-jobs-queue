@@ -18,7 +18,11 @@ README covers what it is and how to install it.
 
 Every guard is overridable per submit (`--timeout`, `--max-output-bytes`,
 `--pool`, `--priority`, `--memory-mb`, `--cpu-percent`) or in
-`~/.config/ajq/config.json`.
+`~/.config/ajq/config.json`. The config `resources` block is what the daemon
+builds its backend from, so `memory_mb` there is the number the cgroup is given —
+the same number admission is checked against. Raise it for jobs that a plain
+`typecheck + coverage` run outgrows; the daemon must be restarted for a resource
+change to reach a running daemon (unlike `hooks.guard_mode`, which is cached).
 
 ## Commands
 

@@ -233,5 +233,35 @@ class TestBackends(helpers.AjqTestCase):
         handle.release()
 
 
+class TestDaemonResourceWiring(helpers.AjqTestCase):
+    """`resources.memory_mb` must size the cgroup, not only the admission check."""
+
+    def test_backend_enforces_the_config_memory_cap(self):
+        import json
+        from unittest import mock
+
+        from ajq import daemon as ajq_daemon
+        from ajq import paths
+
+        with open(paths.CONFIG_PATH, "w", encoding="utf-8") as stream:
+            json.dump({"resources": {"memory_mb": 6144, "backend": "auto"}}, stream)
+
+        server = ajq_daemon._Server()
+        try:
+            with mock.patch.object(ajq_daemon._Server, "_install_signals"):
+                server.startup()
+            self.assertEqual(server.config.get("resources.memory_mb"), 6144)
+            self.assertEqual(server.backend.memory_mb, 6144)
+        finally:
+            if server.listener is not None:
+                server.listener.close()
+            try:
+                os.unlink(server.socket_path)
+            except OSError:
+                pass
+            if server.store is not None:
+                server.store.close()
+
+
 if __name__ == "__main__":
     unittest.main()
