@@ -48,7 +48,8 @@ case "$cmd" in
     [ -n "\${STUB_LIST:-}" ] && printf '%s\\n' "\${STUB_LIST}" ;;
   submit) printf 'j-test123\\n' ;;
   status) printf '{"state":"running"}\\n' ;;
-  output) printf 'output-args: %s\\n' "$*" ;;
+  output)
+    if [ -n "\${STUB_OUTPUT_EMPTY:-}" ]; then exit 0; else printf 'output-args: %s\\n' "$*"; fi ;;
   wait) printf 'state done\\nlog line one\\nlog line two\\n' ;;
 esac
 exit 0
@@ -117,7 +118,7 @@ test("setup registers the native tools", async () => {
   const { tools } = await load("warn");
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["ajq_status", "ajq_submit", "ajq_wait"],
+    ["ajq_output", "ajq_status", "ajq_submit", "ajq_wait"],
   );
 });
 
@@ -178,19 +179,27 @@ test("ajq_submit runs submit with the session directory", async () => {
   assert.match(out.content, /j-test123/);
 });
 
-test("ajq_status reads state and output", async () => {
+test("ajq_status returns state only, never the log", async () => {
   const { tools } = await load("warn");
   const status = tools.find((t) => t.name === "ajq_status");
   const out = await status.execute({ id: "j-test123" }, {});
   assert.match(out.content, /state running/);
-  assert.match(out.content, /output-args:/);
+  assert.doesNotMatch(out.content, /output-args:/);
 });
 
-test("ajq_status clamps a runaway tail", async () => {
+test("ajq_output reads the log and clamps a runaway tail", async () => {
   const { tools } = await load("warn");
-  const status = tools.find((t) => t.name === "ajq_status");
-  const out = await status.execute({ id: "j-test123", tail: 99999999999999 }, {});
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", tail: 99999999999999 }, {});
+  assert.match(out.content, /output-args:/);
   assert.match(out.content, /--tail 1000\b/);
+});
+
+test("ajq_output says when a job has no output", async () => {
+  const { tools } = await load("warn", { STUB_OUTPUT_EMPTY: "1" });
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-empty" }, {});
+  assert.match(out.content, /has no output/);
 });
 
 test("ajq_wait returns the final state and log in one call", async () => {

@@ -53,7 +53,7 @@ ajq status <id> --fields state,elapsed_s,out_bytes   # only what you need
 ajq list                    # queued + running
 ajq list --fields id,state,eta_start_s --all        # compact table of everything
 ajq output <id> --tail 80  # captured output
-ajq wait <id>              # block until terminal
+ajq wait <id> --tail 80    # block until terminal, then state + the log tail
 ajq cancel <id>
 ```
 
@@ -109,6 +109,10 @@ The old reflex — `sleep 115` — exists only because a *shell* call is SIGTERM
 - **OpenCode's `ajq_wait` tool**: the same wait in-process (state + tail, not the
   shell's 120 s timeout). Good for a job that finishes within a turn; for a long
   one, background `ajq wait` instead.
+
+In OpenCode, `ajq_status` returns **state only** — no log. That is deliberate, so a
+running job cannot be polled for output. Read the log with `ajq_output`, or get
+state + log together with `ajq_wait`.
 
 To watch a job while it runs: `ajq output <id> --follow` (streams until the job
 is terminal). `--from-start` replays the whole log instead of the last 40 lines.

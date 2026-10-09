@@ -116,7 +116,7 @@ backend and says so rather than implying parity.
 
 | Harness | Skill | Hooks | Tool guard |
 | --- | --- | --- | --- |
-| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` / `ajq_wait` tools |
+| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` tools |
 | Claude Code | yes | `SessionStart` + `PreToolUse Bash` in `settings.json` | yes |
 | Codex | yes | `SessionStart` + `PreToolUse Bash` in `hooks.json` | yes |
 | Kiro | yes | `~/.kiro/hooks/ajq.json` (`SessionStart`, `PreToolUse`) | yes |

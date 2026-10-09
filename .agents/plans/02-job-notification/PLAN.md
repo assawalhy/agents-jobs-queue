@@ -30,8 +30,10 @@ the wait sidesteps the timeout entirely.
 
 - `ajq wait <id> --tail N`: one call returns the final state and the last N log lines.
 - OpenCode `ajq_wait` tool: the same wait in-process (state + tail), not the shell timeout.
-- `ajq_status`'s `tail` is clamped (max 1000): a model passing a runaway tail as
-  a wait can no longer read the whole log.
+- `ajq_status` returns **state only** (no log): a running job can no longer be
+  polled for output. The log moved to `ajq_output` (clamped), and `ajq_wait`
+  returns state + log in one call. The CLI `--tail` also accepts scientific
+  notation (`4e+24`) and caps it, so a runaway value cannot crash it.
 - Skill + hook text: wait (background it for a slow job); never sleep, never poll `ajq status`.
 
 ## Milestones
