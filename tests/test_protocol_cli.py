@@ -222,5 +222,136 @@ class TestWaitTail(helpers.AjqTestCase):
         self.assertNotIn("l1", printed)
 
 
+class TestOutputRange(helpers.AjqTestCase):
+    def _write_log(self, job_id, body):
+        from ajq import paths
+
+        paths.ensure_dir(paths.job_dir(job_id))
+        out = paths.job_out_path(job_id)
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        return out
+
+    def _run_output(self, job_id, out, argv):
+        import contextlib
+        import io
+
+        from ajq import cli
+
+        saved = cli._request
+        cli._request = lambda payload, timeout=30.0: {
+            "ok": True,
+            "job": {"id": job_id, "state": "done", "out_path": out},
+        }
+        try:
+            args = cli._build_parser().parse_args(["output", job_id] + argv)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cli._cmd_output(args)
+        finally:
+            cli._request = saved
+        return code, buffer.getvalue()
+
+    def test_head_reads_the_first_lines(self):
+        out = self._write_log("j-head", "a\nb\nc\nd\ne\n")
+        code, printed = self._run_output("j-head", out, ["--head", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(printed, "a\nb\n")
+
+    def test_offset_tail_reads_a_window(self):
+        out = self._write_log("j-win", "a\nb\nc\nd\ne\n")
+        _code, printed = self._run_output("j-win", out, ["--offset", "1", "--tail", "2"])
+        self.assertEqual(printed, "b\nc\n")
+
+    def test_offset_head_reads_a_window(self):
+        out = self._write_log("j-win2", "a\nb\nc\nd\ne\n")
+        _code, printed = self._run_output("j-win2", out, ["--offset", "2", "--head", "2"])
+        self.assertEqual(printed, "c\nd\n")
+
+    def test_default_tail_is_unchanged(self):
+        out = self._write_log("j-def", "a\nb\nc\n")
+        _code, printed = self._run_output("j-def", out, [])
+        self.assertEqual(printed, "a\nb\nc\n")
+
+    def test_offset_past_eof_is_empty(self):
+        out = self._write_log("j-past", "a\nb\n")
+        _code, printed = self._run_output("j-past", out, ["--offset", "10"])
+        self.assertEqual(printed, "")
+
+    def test_from_start_ignores_head_and_offset(self):
+        out = self._write_log("j-all", "a\nb\nc\n")
+        _code, printed = self._run_output(
+            "j-all", out, ["--from-start", "--head", "1", "--offset", "1"]
+        )
+        self.assertEqual(printed, "a\nb\nc\n")
+
+
+class TestCancelCli(helpers.AjqTestCase):
+    def test_kill_alias_parses(self):
+        from ajq import cli
+
+        args = cli._build_parser().parse_args(["kill", "j-x"])
+        self.assertEqual(args.id, "j-x")
+        self.assertFalse(args.no_wait)
+
+    def test_no_wait_flag_parses(self):
+        from ajq import cli
+
+        args = cli._build_parser().parse_args(["cancel", "j-x", "--no-wait"])
+        self.assertTrue(args.no_wait)
+
+    def test_cancel_waits_and_reports_the_final_state(self):
+        import argparse
+        import contextlib
+        import io
+
+        from ajq import cli
+
+        saved_req, saved_wait = cli._request, cli._wait_for
+        cli._request = lambda payload, timeout=30.0: {
+            "ok": True,
+            "job": {"id": "j-c", "state": "running", "kill_grace_s": 1.0},
+        }
+        cli._wait_for = lambda job_id, timeout: {
+            "id": job_id,
+            "state": "canceled",
+            "kill_reason": "canceled",
+            "signal": 15,
+        }
+        try:
+            args = argparse.Namespace(id="j-c", no_wait=False, json=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cli._cmd_cancel(args)
+        finally:
+            cli._request, cli._wait_for = saved_req, saved_wait
+        self.assertEqual(code, 0)
+        printed = buffer.getvalue()
+        self.assertIn("canceled", printed)
+        self.assertIn("signal 15", printed)
+
+    def test_cancel_no_wait_reports_still_running(self):
+        import argparse
+        import contextlib
+        import io
+
+        from ajq import cli
+
+        saved = cli._request
+        cli._request = lambda payload, timeout=30.0: {
+            "ok": True,
+            "job": {"id": "j-nw", "state": "running", "kill_grace_s": 1.0},
+        }
+        try:
+            args = argparse.Namespace(id="j-nw", no_wait=True, json=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cli._cmd_cancel(args)
+        finally:
+            cli._request = saved
+        self.assertEqual(code, 2)
+        self.assertIn("running", buffer.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,7 @@ case "$cmd" in
   status) printf '{"state":"running"}\\n' ;;
   output)
     if [ -n "\${STUB_OUTPUT_EMPTY:-}" ]; then exit 0; else printf 'output-args: %s\\n' "$*"; fi ;;
+  cancel) printf 'cancel-args: %s\\n' "$*" ;;
   wait) printf 'state done\\nlog line one\\nlog line two\\n' ;;
 esac
 exit 0
@@ -105,6 +106,7 @@ async function load(mode, extraEnv = {}) {
   process.env.STUB_MODE = mode;
   delete process.env.STUB_DAEMON;
   delete process.env.STUB_LIST;
+  delete process.env.STUB_OUTPUT_EMPTY;
   Object.assign(process.env, extraEnv);
   const url = `${pathToFileURL(PLUGIN.pathname).href}?t=${Math.random()}`;
   const mod = await import(url);
@@ -120,7 +122,7 @@ test("setup registers the native tools", async () => {
   const { tools } = await load("warn");
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["ajq_output", "ajq_status", "ajq_submit", "ajq_wait"],
+    ["ajq_cancel", "ajq_output", "ajq_status", "ajq_submit", "ajq_wait"],
   );
 });
 
@@ -236,6 +238,37 @@ test("ajq_output says when a job has no output", async () => {
   const output = tools.find((t) => t.name === "ajq_output");
   const out = await output.execute({ id: "j-empty" }, {});
   assert.match(out.content, /has no output/);
+});
+
+test("ajq_output reads a head instead of the tail", async () => {
+  const { tools } = await load("warn");
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", head: 20 }, {});
+  assert.match(out.content, /--head 20\b/);
+  assert.doesNotMatch(out.content, /--tail/);
+});
+
+test("ajq_output reads an offset window", async () => {
+  const { tools } = await load("warn");
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", offset: 100, tail: 50 }, {});
+  assert.match(out.content, /--tail 50\b/);
+  assert.match(out.content, /--offset 100\b/);
+});
+
+test("ajq_cancel kills a job and waits by default", async () => {
+  const { tools } = await load("warn");
+  const cancel = tools.find((t) => t.name === "ajq_cancel");
+  const out = await cancel.execute({ id: "j-test123" }, {});
+  assert.match(out.content, /cancel-args: j-test123/);
+  assert.doesNotMatch(out.content, /--no-wait/);
+});
+
+test("ajq_cancel wait false returns without waiting", async () => {
+  const { tools } = await load("warn");
+  const cancel = tools.find((t) => t.name === "ajq_cancel");
+  const out = await cancel.execute({ id: "j-test123", wait: false }, {});
+  assert.match(out.content, /--no-wait/);
 });
 
 test("ajq_wait returns the final state and log in one call", async () => {
