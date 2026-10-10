@@ -462,12 +462,27 @@ def _cmd_output(args: argparse.Namespace) -> int:
             sys.stdout.write(handle.read())
         else:
             lines = handle.read().splitlines()
-            tail = lines[-args.tail :] if args.tail > 0 else []
-            if tail:
-                sys.stdout.write("\n".join(tail) + "\n")
+            window = _output_window(lines, args.offset, args.head, args.tail)
+            if window:
+                sys.stdout.write("\n".join(window) + "\n")
     finally:
         handle.close()
     return 0
+
+
+def _output_window(lines: list[str], offset: int, head: int | None, tail: int) -> list[str]:
+    """The lines `ajq output` prints: a head, an offset window, or the tail.
+
+    With no offset, `--tail` keeps its "last N" meaning; with an offset it
+    becomes "the next N after the offset", so `--offset 100 --tail 50` is the
+    window [100, 150). `--head` always counts from the offset.
+    """
+    offset = max(0, offset or 0)
+    if head is not None:
+        return lines[offset : offset + head] if head > 0 else []
+    if offset:
+        return lines[offset : offset + tail] if tail > 0 else []
+    return lines[-tail:] if tail > 0 else []
 
 
 def _follow(job: dict, handle, args: argparse.Namespace) -> int:
@@ -499,13 +514,32 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     job = _job_or_fail(_request({"op": "cancel", "id": args.id}))
     if not job:
         return 1
+    # A queued job is terminal the moment cancel returns; a running one is only
+    # signalled, so wait (bounded by its kill grace) for the real terminal state
+    # instead of reporting "running" and lying about the kill.
+    if not args.no_wait and _state_of(job) not in TERMINAL_STATES:
+        waited = _wait_for(args.id, _grace_of(job) + 2.0)
+        if waited:
+            job = waited
+    state = _state_of(job)
     if args.json:
         _emit(job)
-        return 0
-    print(f"{job.get('id')}  {_state_of(job)}")
+        return 0 if state in TERMINAL_STATES else 2
+    print(f"{job.get('id')}  {state}")
     if job.get("kill_reason"):
         print(f"kill_reason {job['kill_reason']}")
-    return 0
+    if job.get("signal"):
+        print(f"signal {job['signal']}")
+    return 0 if state in TERMINAL_STATES else 2
+
+
+def _grace_of(job: dict) -> float:
+    """A job's SIGTERM→SIGKILL grace, defaulting to the config default."""
+    try:
+        grace = float(job.get("kill_grace_s") or 0)
+    except (TypeError, ValueError):
+        grace = 0.0
+    return grace if grace > 0 else 10.0
 
 
 def _job_tail(job: dict, count: int) -> list[str]:
@@ -963,12 +997,19 @@ def _build_parser() -> argparse.ArgumentParser:
     output = add("output", "print a job's captured output", _cmd_output, aliases=("logs",))
     output.add_argument("id", help="job id")
     output.add_argument("--tail", type=_tail_count, default=40, metavar="N", help="last N lines (default 40)")
+    output.add_argument("--head", type=_tail_count, default=None, metavar="N", help="first N lines instead of the tail")
+    output.add_argument("--offset", type=_tail_count, default=0, metavar="N", help="skip the first N lines, then take --tail/--head")
     output.add_argument("--follow", "-f", action="store_true", help="stream until the job is terminal")
     output.add_argument("--from-start", action="store_true", help="show the whole log, not the tail")
     output.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up following after S")
 
-    cancel = add("cancel", "cancel a queued or running job", _cmd_cancel)
+    cancel = add("cancel", "cancel a queued or running job", _cmd_cancel, aliases=("kill",))
     cancel.add_argument("id", help="job id")
+    cancel.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="return as soon as the job is signalled, without waiting for it to die",
+    )
 
     wait = add("wait", "block until a job is terminal", _cmd_wait)
     wait.add_argument("id", help="job id")

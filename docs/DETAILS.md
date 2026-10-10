@@ -31,9 +31,9 @@ change to reach a running daemon (unlike `hooks.guard_mode`, which is cached).
 | `ajq submit [--kind K] [--pool P] [--timeout S] [--priority N] [--serial-key K] [--wait] -- cmd args…` | Queue a command (`--shell` to run a shell string) |
 | `ajq status <id> [--json] [--fields a,b] [-v]` | State, queue position, elapsed, ETAs, output path and size, exit code |
 | `ajq list [--all] [--json] [--fields a,b]` | Queued + running, or everything |
-| `ajq output <id> [--tail N] [--follow] [--from-start]` | The recorded output |
+| `ajq output <id> [--tail N\|--head N] [--offset N] [--follow] [--from-start]` | The recorded output: a tail (default 40), a head, or an offset window |
 | `ajq wait <id> [--tail N] [--timeout S] [--fields a,b]` | Block until terminal; `--tail` prints the last N log lines so one call returns state + log; exit 0 only for `done` |
-| `ajq cancel <id>` | Cancel a queued or running job |
+| `ajq cancel <id> [--no-wait]` (alias `ajq kill`) | Stop a queued or running job; waits (bounded by its kill grace) for the final state |
 | `ajq stats [--clear]` | Estimate table with per-signature MAPE |
 | `ajq guard --explain "<cmd>"` | Why a command is heavy or light, and the `ajq` equivalent |
 | `ajq config [--print-default\|--seed\|--force-config]` | Inspect or seed the config |
@@ -120,7 +120,7 @@ backend and says so rather than implying parity.
 
 | Harness | Skill | Hooks | Tool guard |
 | --- | --- | --- | --- |
-| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` tools |
+| OpenCode | yes | plugin `~/.config/opencode/plugins/ajq.js` (V2 API, verified on 2.0.26) | yes, plus native `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` / `ajq_cancel` tools |
 | Claude Code | yes | `SessionStart` + `PreToolUse Bash` in `settings.json` | yes |
 | Codex | yes | `SessionStart` + `PreToolUse Bash` in `hooks.json` | yes |
 | Kiro | yes | `~/.kiro/hooks/ajq.json` (`SessionStart`, `PreToolUse`) | yes |
@@ -195,8 +195,16 @@ Environment overrides: `AJQ_MAX_CONCURRENT`, `AJQ_POOL`, `AJQ_TIMEOUT_S`,
 ~/.local/state/ajq/jobs/<id>/out.log              captured output, mode 0600
 ~/.local/state/ajq/jobs/<id>/meta.json            the same metadata as a sidecar
 ~/.local/state/ajq/ajqd.pid                        live daemon pid
+~/.local/state/ajq/ajqd.lock                       the single-daemon flock
 /run/user/<uid>/ajq/ajqd.sock                      control socket (dir 0700)
 ```
+
+**One daemon per state dir.** `ajqd` holds an exclusive `flock` on `ajqd.lock`
+for its lifetime, so a second daemon exits instead of sharing the queue — the
+kernel releases the lock if it crashes. This is what makes `ajq cancel` reliable:
+only one daemon owns the in-memory `_running` map, so a cancel cannot land on a
+daemon that did not start the job. As a safety net, a cancel for a running job
+with no local runner kills the process group recorded in `state.db`.
 
 A daemon crash leaves `running` jobs marked `lost` on the next start; their
 output files stay readable. `ajq prune` removes finished jobs and their output.

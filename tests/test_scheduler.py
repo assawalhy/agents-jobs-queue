@@ -32,6 +32,16 @@ def wait_for_state(scheduler, job_id, states, timeout=15.0):
     )
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class TestSubmit(helpers.AjqTestCase):
     def test_submit_fills_metadata_and_defaults(self):
         scheduler, _ = make_scheduler(self)
@@ -203,6 +213,22 @@ class TestLifecycle(helpers.AjqTestCase):
         scheduler.cancel(job["id"])
         self.assertTrue(wait_for_state(scheduler, job["id"], {"canceled", "timeout", "failed"}))
         self.assertEqual(store.get(job["id"])["kill_reason"], "canceled")
+
+    def test_cancel_without_a_local_runner_kills_the_recorded_pid(self):
+        """A job started by another daemon (no local cancel event) still dies."""
+        scheduler, store = make_scheduler(self)
+        job = scheduler.submit(
+            argv=[PY, "-c", "import time; time.sleep(30)"], cwd=self.state_dir
+        )
+        scheduler.tick()
+        pid = store.get(job["id"])["pid"]
+        self.assertGreater(pid, 0)
+        # simulate the other-daemon case: this scheduler has no event for it
+        with scheduler._lock:
+            scheduler._running.pop(job["id"], None)
+        scheduler.cancel(job["id"])
+        self.assertTrue(wait_for_state(scheduler, job["id"], {"canceled", "failed", "timeout"}))
+        self.assertTrue(helpers.wait_until(lambda: not _pid_alive(pid), timeout=5.0))
 
     def test_finish_populates_estimate_cache(self):
         from ajq import estimate as est

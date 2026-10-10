@@ -8,8 +8,9 @@
 //      "warn", append a note pointing the model at `ajq submit`
 //   3. on `execute.before`, when hooks.guard_mode is "block", deny a heavy shell
 //      command with a reason naming `ajq submit`
-//   4. register `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` so the
-//      model can queue, check, read and wait for work without a shell
+//   4. register `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` /
+//      `ajq_cancel` so the model can queue, check, read, wait for and kill work
+//      without a shell
 //
 // The V2 shell tool is named "shell" (V1 called it "bash"); both are accepted.
 // Classification stays in Python (`ajq guard --explain`) — one source of truth.
@@ -24,6 +25,9 @@ import { execFile } from "node:child_process";
 
 const CLI_MS = 15000;
 const ENSURE_MS = 4000;
+// `ajq cancel` waits for the job to die (bounded by its kill grace), so it can
+// outlive the plain CLI budget.
+const CANCEL_MS = 30000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
 // V2 renamed the shell tool from "bash" to "shell"; accept both so a version
@@ -216,8 +220,14 @@ const STATUS_DESCRIPTION =
   "and get the log in one call. Never poll it in a loop.";
 
 const OUTPUT_DESCRIPTION =
-  "Read the tail of an ajq job's captured output. Use it once ajq_status shows a terminal state; " +
-  "to wait for that and get the log in one call, use ajq_wait instead.";
+  "Read an ajq job's captured output: the tail by default, the first lines with head, or any " +
+  "window with offset. Use it once ajq_status shows a terminal state; to wait for that and get " +
+  "the log in one call, use ajq_wait instead.";
+
+const CANCEL_DESCRIPTION =
+  "Cancel (kill) a queued or running ajq job. A queued job is removed at once; a running one is " +
+  "SIGTERMed and SIGKILLed after its grace period, and this call waits (bounded) for it to die so " +
+  "you get the final state. Pass wait: false to return as soon as it is signalled.";
 
 const WAIT_DESCRIPTION =
   "Wait for an ajq job to finish and return its final state plus the tail of its output in one " +
@@ -336,12 +346,33 @@ async function runOutput(args) {
   try {
     const id = text(args.id);
     if (id === "") return { content: "ajq_output: id is required" };
-    const cliArgs = ["output", id, "--tail", String(clampTail(args.tail, 40))];
-    if (args.from_start === true) cliArgs.push("--from-start");
+    const cliArgs = ["output", id];
+    if (args.from_start === true) {
+      cliArgs.push("--from-start");
+    } else if (args.head !== undefined && args.head !== null) {
+      cliArgs.push("--head", String(clampTail(args.head, 40)));
+    } else {
+      cliArgs.push("--tail", String(clampTail(args.tail, 40)));
+    }
+    const offset = clampTail(args.offset, 0);
+    if (offset > 0) cliArgs.push("--offset", String(offset));
     const out = text(await spawnText(cliArgs, CLI_MS));
     return { content: out === "" ? `ajq_output: ${id} has no output` : out };
   } catch (err) {
     return { content: `ajq_output failed: ${err && err.message ? err.message : String(err)}` };
+  }
+}
+
+async function runCancel(args) {
+  try {
+    const id = text(args.id);
+    if (id === "") return { content: "ajq_cancel: id is required" };
+    const cliArgs = ["cancel", id];
+    if (args.wait === false) cliArgs.push("--no-wait");
+    const out = text(await spawnText(cliArgs, CANCEL_MS));
+    return { content: out === "" ? `ajq_cancel: no output for ${id}` : out };
+  } catch (err) {
+    return { content: `ajq_cancel failed: ${err && err.message ? err.message : String(err)}` };
   }
 }
 
@@ -402,7 +433,24 @@ function outputInput() {
     properties: {
       id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
       tail: { type: "number", description: "Trailing log lines to return; omit for 40." },
+      head: { type: "number", description: "First N lines instead of the tail." },
+      offset: { type: "number", description: "Skip the first N lines, then take tail/head." },
       from_start: { type: "boolean", description: "Return the whole log, not just the tail." },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  };
+}
+
+function cancelInput() {
+  return {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
+      wait: {
+        type: "boolean",
+        description: "Wait for the job to die and return its final state; omit for true.",
+      },
     },
     required: ["id"],
     additionalProperties: false,
@@ -452,6 +500,12 @@ export default {
           description: WAIT_DESCRIPTION,
           input: waitInput(),
           execute: (args) => runWait(args),
+        });
+        editor.add({
+          name: "ajq_cancel",
+          description: CANCEL_DESCRIPTION,
+          input: cancelInput(),
+          execute: (args) => runCancel(args),
         });
       });
     } catch {
