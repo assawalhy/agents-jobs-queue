@@ -56,9 +56,11 @@ ajq status <id>             # state, pool, timing, output path
 ajq status <id> --fields state,elapsed_s,out_bytes   # only what you need
 ajq list                    # queued + running
 ajq list --fields id,state,eta_start_s --all        # compact table of everything
-ajq output <id> --tail 80  # captured output
+ajq output <id> --tail 80  # captured output (the tail)
+ajq output <id> --head 50  # the first lines instead
+ajq output <id> --offset 200 --tail 80   # an interior window
 ajq wait <id> --tail 80    # block until terminal, then state + the log tail
-ajq cancel <id>
+ajq cancel <id>            # kill it (alias `ajq kill <id>`); waits for the final state
 ```
 
 Useful keys: `state`, `queue_position`, `elapsed_s`, `eta_start_s`, `eta_run_s`,
@@ -121,11 +123,20 @@ The old reflex — `sleep 115` — exists only because a *shell* call is SIGTERM
   `wait_s: 0` to always get the id immediately.
 
 In OpenCode, `ajq_status` returns **state only** — no log. That is deliberate, so a
-running job cannot be polled for output. Read the log with `ajq_output`, or get
-state + log together with `ajq_wait`.
+running job cannot be polled for output. Read the log with `ajq_output` (the tail,
+or `head`/`offset` for any window), or get state + log together with `ajq_wait`.
+`ajq_cancel` kills a job and returns its final state in one call.
 
 To watch a job while it runs: `ajq output <id> --follow` (streams until the job
 is terminal). `--from-start` replays the whole log instead of the last 40 lines.
+`--head N` reads the first N lines and `--offset N` skips N lines before the
+tail/head, so `--offset 200 --tail 80` is an interior window — read the top of a
+long log without dumping all of it.
+
+`ajq cancel <id>` (alias `ajq kill <id>`) stops a queued or running job and then
+**waits** (bounded by its `kill_grace_s`) for it to actually die, printing the
+final state — so one call confirms the kill. `--no-wait` returns as soon as the
+job is signalled. A running job is SIGTERMed, then SIGKILLed after the grace.
 
 ## Cheap polling
 

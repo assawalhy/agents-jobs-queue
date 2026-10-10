@@ -58,6 +58,11 @@ def pid_path() -> str:
     return os.path.join(paths.STATE_DIR, "ajqd.pid")
 
 
+def lock_path() -> str:
+    """The singleton lock every daemon on this state dir must hold."""
+    return os.path.join(paths.STATE_DIR, "ajqd.lock")
+
+
 def log_path() -> str:
     return os.path.join(paths.STATE_DIR, "ajqd.log")
 
@@ -184,6 +189,12 @@ def _systemctl_start(unit: str) -> bool:
     return code == 0
 
 
+def _unit_installed(unit: str) -> bool:
+    """True when systemd knows this unit (installed, whether enabled or not)."""
+    code, _ = _run(["systemctl", "--user", "cat", unit], timeout=3.0)
+    return code == 0
+
+
 def launchctl_plist() -> str:
     return os.path.expanduser(os.path.join("~", LAUNCH_AGENTS))
 
@@ -280,12 +291,15 @@ def ensure_running(timeout: float = 5.0) -> bool:
     if _autostart_disabled():
         return False
     deadline = time.monotonic() + max(0.5, float(timeout))
-    if platform.IS_LINUX and _systemctl_start(_unit_name()):
-        if _wait_for_socket(path, deadline):
-            return True
-    if platform.IS_MACOS and _launchctl_bootstrap():
-        if _wait_for_socket(path, deadline):
-            return True
+    # Prefer the service manager. When its unit/agent is installed, do not fall
+    # back to a detached spawn: two daemons on one state dir is the race the
+    # singleton lock exists to stop, and the lock would leave one idle anyway.
+    if platform.IS_LINUX and _unit_installed(_unit_name()):
+        _systemctl_start(_unit_name())
+        return _wait_for_socket(path, deadline)
+    if platform.IS_MACOS and os.path.isfile(launchctl_plist()):
+        _launchctl_bootstrap()
+        return _wait_for_socket(path, deadline)
     if spawn_detached() and _wait_for_socket(path, deadline):
         return True
     return False
@@ -418,6 +432,8 @@ class _Server:
         self.scheduler: Optional[Scheduler] = None
         self.backend_name = "unknown"
         self.recovered = 0
+        self._lock_fd: Optional[int] = None
+        self._socket_ino = 0
         self._conn_lock = threading.Lock()
         self._conn_threads: set[threading.Thread] = set()
         self._ops: dict[str, Callable[[dict], dict]] = {
@@ -449,9 +465,18 @@ class _Server:
             os.chmod(parent, 0o700)
         except OSError:
             pass
-        # Check before unlinking: unlinking first would pull the socket out from
-        # under the live daemon and let a second one bind the same path.
+        # One daemon per state dir. The flock is race-free and survives an
+        # unlinked socket, unlike the ping check below: without it two daemons
+        # can tick the same queue and a cancel can land on the wrong one.
+        if not self._acquire_singleton():
+            raise RuntimeError(
+                f"another ajqd is already serving {paths.STATE_DIR} "
+                f"(pid {read_pid()}); run `ajq daemon status`"
+            )
+        # Belt and braces: a pre-lock daemon (or one bound to the same path by
+        # another route) may answer the socket without holding the lock.
         if self._another_instance_live():
+            self._release_singleton()
             raise RuntimeError(
                 f"another ajqd is already listening on {self.socket_path} "
                 f"(pid {read_pid()}); run `ajq daemon status`"
@@ -478,6 +503,51 @@ class _Server:
             + (f" recovered={self.recovered}" if self.recovered else "")
         )
 
+    def _acquire_singleton(self) -> bool:
+        """Hold `$STATE_DIR/ajqd.lock` for this process's lifetime.
+
+        flock is released by the kernel when the process dies, so a crash never
+        leaves a stale lock (a pidfile check cannot say that). Returns False when
+        another live daemon owns the state dir; True when locked, or when the
+        platform has no fcntl (a non-POSIX host falls back to the ping check).
+        """
+        try:
+            import fcntl
+        except ImportError:  # non-POSIX
+            return True
+        try:
+            fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            _log(f"cannot open {lock_path()}: {exc}")
+            return True  # never block startup on a filesystem quirk
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass
+        self._lock_fd = fd
+        return True
+
+    def _release_singleton(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def _another_instance_live(self) -> bool:
         """Refuse to clobber a daemon that is already answering on this socket."""
         return protocol_ready(self.socket_path)
@@ -492,6 +562,10 @@ class _Server:
         listener.listen(128)
         listener.settimeout(_ACCEPT_TIMEOUT_S)
         self.listener = listener
+        try:
+            self._socket_ino = os.stat(self.socket_path).st_ino
+        except OSError:
+            self._socket_ino = 0
 
     def _write_pidfile(self) -> None:
         try:
@@ -579,13 +653,29 @@ class _Server:
                 self.store.close()
             except Exception:
                 pass
-        _remove(self.socket_path, "socket")
+        self._unlink_socket()
         # Only clear the pidfile if it is still ours: a restart that raced us
         # may already have written a new one.
         if read_pid() == os.getpid():
             _remove(pid_path(), "pidfile")
+        self._release_singleton()
         _log("stopped")
         return 0
+
+    def _unlink_socket(self) -> None:
+        """Remove the socket file only when it is still the one we bound.
+
+        Unlinking by name is not safe: a daemon that lost the path would delete
+        the live daemon's socket and make it unreachable.
+        """
+        if not self._socket_ino:
+            return
+        try:
+            if os.stat(self.socket_path).st_ino != self._socket_ino:
+                return
+        except OSError:
+            return
+        _remove(self.socket_path, "socket")
 
     def _close_listener(self) -> None:
         listener, self.listener = self.listener, None
@@ -847,11 +937,11 @@ def serve(socket_path: str | None = None) -> int:
         # Only clear the pidfile if we are the ones who wrote it.
         if os.getpid() == read_pid():
             _remove(pid_path(), "pidfile")
-        if "already listening" in str(exc):
-            # Another live daemon owns the socket. Exit 0 on purpose: under
-            # systemd `Restart=always` a non-zero exit would crash-loop forever
-            # while a perfectly healthy daemon is serving. `ajq daemon ensure`
-            # restarts the unit if that other daemon ever goes away.
+        if "another ajqd" in str(exc):
+            # Another live daemon owns this state dir. Exit 0 on purpose: under
+            # systemd a non-zero exit would restart-loop forever while a
+            # perfectly healthy daemon is serving. `ajq daemon ensure` restarts
+            # the unit if that other daemon ever goes away.
             _log("another daemon is serving; exiting 0 without restarting")
             return 0
         return 1

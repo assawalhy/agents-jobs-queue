@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -369,7 +370,37 @@ class Scheduler:
                 entry = self._running.get(job_id)
             if entry is not None:
                 entry["cancel"].set()
+            else:
+                # No local runner owns this job: a stale daemon (or one from
+                # before the singleton lock) started it. Kill the process group
+                # recorded in the shared DB so the job still dies; its owner
+                # records the terminal state when the child exits.
+                self._kill_recorded(job)
         return self.enrich(self.store.get(job_id) or job)
+
+    def _kill_recorded(self, job: dict) -> None:
+        """SIGTERM then SIGKILL the process group a job recorded in the DB."""
+        pid = _as_int(job.get("pid"))
+        if pid <= 1:
+            return
+        try:
+            group = os.getpgid(pid)
+        except OSError:
+            return
+        if group <= 1 or group == os.getpgid(0):
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(group, sig)
+            except OSError:
+                return
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(group, 0)
+                except OSError:
+                    return
+                time.sleep(0.05)
 
     # ------------------------------------------------------------- enrichment
     def enrich(self, job: dict) -> dict:

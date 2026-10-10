@@ -397,7 +397,7 @@ After=default.target
 Type=simple
 ExecStart=$AJQ_BIN daemon serve
 Environment=PATH=$PATH
-Restart=always
+Restart=on-failure
 RestartSec=2
 KillMode=mixed
 TimeoutStopSec=60
@@ -449,7 +449,10 @@ write_plist() {
     <string>serve</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>$PATH</string>
