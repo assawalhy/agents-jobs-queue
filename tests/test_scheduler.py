@@ -141,6 +141,39 @@ class TestScheduling(helpers.AjqTestCase):
         self.assertEqual(scheduler.tick(), [])
         self.assertEqual(store.count_by_state().get("queued"), 1)
 
+    def test_pool_memory_is_resolved_on_submit(self):
+        scheduler, _ = make_scheduler(
+            self,
+            resources={"memory_mb": 2048, "pool_memory_mb": {"heavy": 6144, "light": 1024}},
+        )
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy")
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light")
+        other = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="service")
+        explicit = scheduler.submit(
+            argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", memory_mb=4096
+        )
+        self.assertEqual(heavy["memory_mb"], 6144)
+        self.assertEqual(light["memory_mb"], 1024)
+        self.assertEqual(other["memory_mb"], 2048)
+        self.assertEqual(explicit["memory_mb"], 4096)
+
+    def test_pool_memory_blocks_heavy_but_admits_light(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}},
+            resources={
+                "memory_mb": 2048,
+                "memory_headroom": 1.2,
+                "pool_memory_mb": {"heavy": 8 * 1024 * 1024, "light": 1},
+            },
+        )
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="w0")
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="w1")
+        started = scheduler.tick()
+        self.assertEqual(started, [light["id"]])
+        self.assertEqual(store.get(heavy["id"])["state"], "queued")
+        self.assertEqual(store.get(light["id"])["state"], "running")
+
     def test_queue_position_counts_ahead(self):
         scheduler, _ = make_scheduler(self)
         first = scheduler.submit(argv=SHORT, cwd=self.state_dir)

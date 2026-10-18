@@ -38,6 +38,7 @@ case "$cmd" in
     shift || true
     if printf '%s' "$*" | grep -qE 'npm test|pytest|heavy'; then
       printf 'heavy: true\\nkind: test\\n'
+      [ -n "\${STUB_SUGGEST:-}" ] && printf 'suggest: %s\\n' "\${STUB_SUGGEST}"
     else
       printf 'heavy: false\\nkind: unknown\\n'
     fi ;;
@@ -107,6 +108,7 @@ async function load(mode, extraEnv = {}) {
   delete process.env.STUB_DAEMON;
   delete process.env.STUB_LIST;
   delete process.env.STUB_OUTPUT_EMPTY;
+  delete process.env.STUB_SUGGEST;
   Object.assign(process.env, extraEnv);
   const url = `${pathToFileURL(PLUGIN.pathname).href}?t=${Math.random()}`;
   const mod = await import(url);
@@ -157,6 +159,34 @@ test("block denies a heavy shell command", async () => {
     () => Promise.resolve(hooks["execute.before"]({ tool: "shell", input: { command: "npm test" } })),
     /Blocked by ajq .*classified test \(heavy\)/,
   );
+});
+
+// The suggestion has one owner: `ajq guard --explain`. The plugin must repeat
+// it, `--cwd` and all, rather than rebuild its own line from the raw command.
+test("warn repeats the CLI suggestion verbatim", async () => {
+  const { hooks } = await load("warn", { STUB_SUGGEST: "ajq submit --cwd /work/app --shell -- npm test" });
+  const event = heavyEvent();
+  await hooks["execute.after"](event);
+  const texts = event.result.content.map((c) => c.text).join("\n");
+  assert.ok(
+    texts.includes("queue it instead: ajq submit --cwd /work/app --shell -- npm test — then wait"),
+    texts,
+  );
+});
+
+test("block repeats the CLI suggestion verbatim", async () => {
+  const { hooks } = await load("block", { STUB_SUGGEST: "ajq submit --cwd /work/app -- npm test" });
+  await assert.rejects(
+    () => Promise.resolve(hooks["execute.before"]({ tool: "shell", input: { command: "npm test" } })),
+    /or: ajq submit --cwd \/work\/app -- npm test — then wait/,
+  );
+});
+
+test("an older CLI without a suggest line still gets a nudge", async () => {
+  const { hooks } = await load("warn");
+  const event = heavyEvent();
+  await hooks["execute.after"](event);
+  assert.match(event.result.content.map((c) => c.text).join("\n"), /Next time queue it instead: ajq submit --/);
 });
 
 test("block allows light commands", async () => {

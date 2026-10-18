@@ -19,6 +19,12 @@ ajq submit --label api-tests -- pytest tests/api -q
 ajq submit --cwd ../other-worktree -- cargo build
 ```
 
+Give the directory with `--cwd`, never as a `cd <dir> &&` prefix. The daemon
+already runs the job in its own cwd, and a prefix hides the command in
+`ajq list`, so the whole row reads `cd /home/...` instead of the command you
+meant. Reach for `--shell` only when the command really needs a shell: pipes,
+`&&`, redirects, globs, env prefixes.
+
 Keep running these directly — they are milliseconds and the queue adds nothing:
 
 `git status` / `diff` / `log` / `show` / `branch` / `rev-parse` / `rev-list`,
@@ -47,21 +53,27 @@ ajq guard --explain "npm run build"
 | `--shell` | run through `$SHELL`; needed for pipes, `&&`, globs, and env prefixes. |
 | `--wait` | block until the job is terminal, then print it. Convenient for a quick job; for anything slow, submit then background `ajq wait <id> --tail N`. |
 | `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. A full `typecheck + coverage` run outgrows the default 2 GB — give it `--memory-mb 12288`, or raise `resources.memory_mb` and restart the daemon. |
-| `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. |
+| `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. Prefer `--cwd` over a `cd <dir> &&` prefix. |
 
 ## Reading a job
 
 ```sh
 ajq status <id>             # state, pool, timing, output path
 ajq status <id> --fields state,elapsed_s,out_bytes   # only what you need
-ajq list                    # queued + running
+ajq list                    # queued + running, each row ends with its command
+ajq list --cmd-width 80     # wider command column (0 prints the whole command)
 ajq list --fields id,state,eta_start_s --all        # compact table of everything
+ajq list --select cmd --all                        # just the commands, untrimmed
 ajq output <id> --tail 80  # captured output (the tail)
 ajq output <id> --head 50  # the first lines instead
 ajq output <id> --offset 200 --tail 80   # an interior window
 ajq wait <id> --tail 80    # block until terminal, then state + the log tail
 ajq cancel <id>            # kill it (alias `ajq kill <id>`); waits for the final state
 ```
+
+`ajq list` ends every row with the start of the job's command, trimmed to 48
+characters with `...` (`--cmd-width N`, `0` for all of it), so a row identifies
+itself without `ajq status <id> --verbose`.
 
 Useful keys: `state`, `queue_position`, `elapsed_s`, `eta_start_s`, `eta_run_s`,
 `eta_total_s`, `est_source`, `out_path`, `out_bytes`, `truncated`, `exit_code`,
@@ -91,6 +103,14 @@ also waits for available memory, so a busy machine delays jobs instead of
 thrashing.
 
 Dev servers and watch processes: `ajq submit --pool service -- npm run dev`.
+
+`ajq start` (alias `ajq start-all`) is a human escape hatch, not an agent tool:
+it starts the entire queued backlog at once, over the pool caps, `max_concurrent`
+and the memory admission gate, after printing the reserved memory and CPU and
+asking for confirmation. It keeps the worktree serial key unless `--ignore-serial`,
+`--dry-run` prints the plan only, and `--json` starts nothing unless `--yes` is
+also given. Never call it to unblock your own job: raise `--priority`, or let the
+queue move, and do not burst the machine someone else is using.
 
 ## Waiting and streaming
 

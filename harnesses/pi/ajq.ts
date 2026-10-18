@@ -90,7 +90,8 @@ export default function (pi) {
         pi,
         ctx,
         `jobs queue up: ${running} running, ${queued} queued — submit builds, tests, ` +
-          `typechecks and anything over ~30s with \`ajq submit -- <command>\`, then read it with ` +
+          `typechecks and anything over ~30s with \`ajq submit --cwd <dir> -- <command>\` ` +
+          `(never as a \`cd <dir> &&\` prefix), then read it with ` +
           `\`ajq status <id> --json\` / \`ajq wait <id>\` / \`ajq output <id>\`.`,
       );
     } catch {

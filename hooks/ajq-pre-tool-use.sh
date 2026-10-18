@@ -121,17 +121,13 @@ if [ "$mode" = "off" ]; then
     exit 0
 fi
 
-# A shell-ish command has to keep its metacharacters, so it needs --shell and a
-# quoted argument; otherwise the agent's own shell would split the line anyway.
-# Flags always go before `--`, so the tail is built separately from them.
-tail="-- $command"
-case "$command" in
-    *'|'* | *'&&'* | *';'* | *'>'* | *'<'* | *'`'* | *'$('*)
-        tail="--shell -- \"$command\""
-        ;;
-esac
-suggest="ajq submit $tail"
-note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Then wait for it with 'ajq wait <id> --tail 80' — background that call so the session stays interactive; it returns the final state and the log in one call. Do not sleep or poll."
+# The CLI owns the suggestion: it turns a `cd <dir> &&` prefix into `--cwd`,
+# adds `--shell` when the command needs a shell, and quotes the tail. Rebuilding
+# that here would give agents two different answers to the same question.
+suggest="$(printf '%s' "$verdict" | sed -n 's/^suggest:[[:space:]]*//p' | head -n 1)"
+[ -n "$suggest" ] || exit 0
+tail="${suggest#ajq submit }"
+note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Prefer '--cwd <dir>' over a 'cd <dir> &&' prefix. Then wait for it with 'ajq wait <id> --tail 80' — background that call so the session stays interactive; it returns the final state and the log in one call. Do not sleep or poll."
 
 if [ "$mode" = "block" ]; then
     # Never deny a tool call on a machine whose queue is not answering.

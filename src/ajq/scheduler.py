@@ -145,6 +145,7 @@ class Scheduler:
         if pool in (None, "", "auto"):
             pool = self._auto_pool(verdict["pool"], kind, est_seconds)
         pool = str(pool)
+        memory_mb = self._memory_for({"memory_mb": memory_mb, "pool": pool})
 
         job = self._add_job(
             self._fields(
@@ -190,6 +191,18 @@ class Scheduler:
         except sqlite3.Error:  # store without the optional per-job override columns
             return self.store.add_job(**{k: v for k, v in fields.items() if k not in _OPTIONAL_FIELDS})
 
+    def _memory_for(self, job: dict) -> int:
+        """A job's memory cap: explicit value, else its pool's, else the global default."""
+        explicit = _as_int(job.get("memory_mb"), 0)
+        if explicit > 0:
+            return explicit
+        tier = str(job.get("pool") or "normal")
+        pools = self.config.get("resources.pool_memory_mb", {}) or {}
+        value = pools.get(tier) if isinstance(pools, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+        return max(1, _as_int(self.config.get("resources.memory_mb", 2048), 2048))
+
     def _auto_pool(self, base_pool: str, kind: str, est_seconds: float) -> str:
         """Guard pool, plus the cheap-unknown promotion the plan asks for."""
         if kind in guard.HEAVY_KINDS:
@@ -227,7 +240,7 @@ class Scheduler:
             key = str(job.get("serial_key") or "")
             if key and key in busy:
                 continue
-            memory = _as_int(job.get("memory_mb")) or _as_int(self.config.get("resources.memory_mb", 2048))
+            memory = self._memory_for(job)
             if free < int(memory * headroom):
                 continue
             if not self._start(job):
@@ -245,12 +258,18 @@ class Scheduler:
         with self._lock:
             if job_id in self._running:
                 return False
-        try:
-            started = self.store.start(
-                job_id, 0, str(getattr(self.backend, "name", "") or "")
-            )  # pid filled in by _record_pid once the child exists
-        except (KeyError, sqlite3.Error):
-            return False
+            # The connection threads and the tick loop both reach _start, so the
+            # queued check and the transition to running must be one critical
+            # section, or a forced start and a tick can spawn the same job twice.
+            fresh = self.store.get(job_id)
+            if fresh is None or str(fresh.get("state") or "") != "queued":
+                return False
+            try:
+                started = self.store.start(
+                    job_id, 0, str(getattr(self.backend, "name", "") or "")
+                )  # pid filled in by _record_pid once the child exists
+            except (KeyError, sqlite3.Error):
+                return False
         if not started:
             return False
         row = dict(started)
@@ -323,6 +342,83 @@ class Scheduler:
                 pass
 
         return add
+
+    # --------------------------------------------------------------- forced start
+    def start_all_plan(self, ignore_serial: bool = False) -> dict:
+        """The queue as a forced start sees it: jobs, blocked count, resource totals.
+
+        Caps do not apply here. The serial key still does unless `ignore_serial`,
+        because two jobs that share a checkout write the same build directories.
+        """
+        queued = self.store.queued_jobs()
+        busy = self._busy_serials()
+        startable: list[dict] = []
+        blocked = 0
+        for job in queued:
+            key = str(job.get("serial_key") or "")
+            if key and not ignore_serial and key in busy:
+                blocked += 1
+                continue
+            startable.append(job)
+            if key:
+                busy.add(key)
+        return self._plan_of(startable, blocked, len(queued), ignore_serial)
+
+    def _busy_serials(self) -> set[str]:
+        return {
+            str(job.get("serial_key"))
+            for job in self.store.running_jobs()
+            if job.get("serial_key")
+        }
+
+    def _plan_of(
+        self, jobs: Sequence[dict], blocked: int, total: int, ignore_serial: bool
+    ) -> dict:
+        default_cpu = max(1, _as_int(self.config.get("resources.cpu_percent", 200), 200))
+        memory = 0
+        cpu = 0
+        pools: dict[str, int] = {}
+        rows: list[dict] = []
+        for job in jobs:
+            reserved = self._memory_for(job)
+            percent = _as_int(job.get("cpu_percent"), default_cpu) or default_cpu
+            tier = str(job.get("pool") or "normal")
+            pools[tier] = pools.get(tier, 0) + 1
+            memory += reserved
+            cpu += percent
+            row = dict(job)
+            row["memory_mb"] = reserved
+            row["cpu_percent"] = percent
+            rows.append(self.enrich(row))
+        caps = self.config.get("limits.pools", {}) or {}
+        return {
+            "total": total,
+            "startable": len(rows),
+            "blocked_by_serial": blocked,
+            "ignore_serial": bool(ignore_serial),
+            "memory_mb": memory,
+            "cpu_percent": cpu,
+            "available_memory_mb": max(0, _as_int(platform.available_memory_mb(), 0)),
+            "total_memory_mb": max(0, _as_int(platform.total_memory_mb(), 0)),
+            "cpu_count": max(0, _as_int(platform.cpu_count(), 0)),
+            "max_concurrent": max(1, _as_int(self.config.get("limits.max_concurrent", 8), 8)),
+            "memory_headroom": _as_float(self.config.get("resources.memory_headroom", 1.2), 1.0),
+            "pool_counts": pools,
+            "pool_caps": {key: _as_int(value) for key, value in caps.items()}
+            if isinstance(caps, dict)
+            else {},
+            "jobs": rows,
+        }
+
+    def start_all(self, ignore_serial: bool = False) -> dict:
+        """Start every job the plan lists; a job that is no longer queued is skipped."""
+        plan = self.start_all_plan(ignore_serial)
+        started: list[str] = []
+        for job in plan["jobs"]:
+            if self._start(job):
+                started.append(str(job["id"]))
+        jobs = [self.enrich(self.store.get(job_id) or {}) for job_id in started]
+        return {"plan": plan, "started": started, "jobs": jobs}
 
     # -------------------------------------------------------------- completion
     def on_finished(self, job: dict, result: RunResult) -> dict:

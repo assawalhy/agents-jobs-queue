@@ -446,6 +446,7 @@ class _Server:
             "stats": self._op_stats,
             "estimates_clear": self._op_estimates_clear,
             "prune": self._op_prune,
+            "start_all": self._op_start_all,
             "shutdown": self._op_shutdown,
         }
 
@@ -907,6 +908,25 @@ class _Server:
         days = 14 if keep_days is None else max(0, int(keep_days))
         removed = self.store.prune(days, remove_files=not keep_files)
         return {"ok": True, "removed": int(removed or 0), "older_than_days": days}
+
+    def _op_start_all(self, payload: dict) -> dict:
+        """Start every queued job now, or report what that would cost.
+
+        `dry_run` returns the plan only, which is what the CLI prompts with; the
+        plan and the start come from the same resolution code, so the numbers the
+        user approves are the numbers that run.
+        """
+        ignore_serial = bool(payload.get("ignore_serial"))
+        if payload.get("dry_run"):
+            plan = self.scheduler.start_all_plan(ignore_serial)
+            return {"ok": True, "plan": plan, "started": [], "jobs": []}
+        result = self.scheduler.start_all(ignore_serial)
+        return {
+            "ok": True,
+            "plan": result["plan"],
+            "started": result["started"],
+            "jobs": result["jobs"],
+        }
 
     def _op_shutdown(self, _payload: dict) -> dict:
         self.stop_event.set()

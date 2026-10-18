@@ -26,6 +26,7 @@ OPS = (
     "stats",
     "estimates_clear",
     "prune",
+    "start_all",
     "shutdown",
 )
 

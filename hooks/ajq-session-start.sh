@@ -58,7 +58,7 @@ queued="$(printf '%s' "$listing" | grep -o '"state": "queued"' | wc -l | tr -d '
 case "$running" in '' | *[!0-9]*) running=0 ;; esac
 case "$queued" in '' | *[!0-9]*) queued=0 ;; esac
 
-text="ajq jobs queue is up: ${running} running, ${queued} queued. Builds, tests, typechecks, lints, installs, docker builds and anything else you expect to take more than about 30 seconds must be submitted with 'ajq submit -- <command>' instead of being run in the shell; the daemon caps concurrency, memory, CPU and output size so parallel agents do not exhaust the machine. Track a job with 'ajq status <id> --json', block on it with 'ajq wait <id>', and read its output with 'ajq output <id>'. Fast reads (git status/diff/log, rg, ls, cat, jq) stay inline."
+text="ajq jobs queue is up: ${running} running, ${queued} queued. Builds, tests, typechecks, lints, installs, docker builds and anything else you expect to take more than about 30 seconds must be submitted with 'ajq submit -- <command>' instead of being run in the shell; the daemon caps concurrency, memory, CPU and output size so parallel agents do not exhaust the machine. Give the directory with 'ajq submit --cwd <dir> -- <command>', never as a 'cd <dir> &&' prefix, and pass --shell only when the command really needs a shell (pipes, &&, redirects, globs). Track a job with 'ajq status <id> --json', block on it with 'ajq wait <id>', and read its output with 'ajq output <id>'. Fast reads (git status/diff/log, rg, ls, cat, jq) stay inline."
 
 case "$HARNESS" in
     kiro)

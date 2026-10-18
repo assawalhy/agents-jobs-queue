@@ -57,6 +57,7 @@ flowchart LR
 | `ajq status` | `ajq status <id> --fields state,elapsed_s` | State, queue position, ETAs, output size — only the keys you ask for |
 | `ajq output` | `ajq output <id> --tail 80` | The captured output: a tail, a `--head`, or an `--offset` window |
 | `ajq cancel` | `ajq cancel <id>` (alias `ajq kill`) | Stop a queued or running job and wait for it to die |
+| `ajq start` | `ajq start` (alias `ajq start-all`) | Start the whole queued backlog now, over the caps, after a confirmation prompt naming the reserved memory and CPU |
 | `ajq stats` | `ajq stats` | Estimate cache with real MAPE accuracy per signature |
 | `ajq doctor` | `ajq doctor` | Backend, socket, unit state, linger, memory, guard mode |
 | `ajq prune` | `ajq prune --all` | Drop finished jobs and their output |
@@ -65,7 +66,7 @@ flowchart LR
 
 ## 🧠 Good to know
 
-- 🧱 **Concurrency is pooled**: `heavy 2 · normal 4 · service 3 · light 6`, global cap 8. A cheap lint never queues behind a Gradle build.
+- 🧱 **Concurrency is pooled**: `heavy 2 · normal 4 · service 3 · light 6`, global cap 8. A cheap lint never queues behind a Gradle build. `ajq start` overrides all of it for the queued backlog, after printing the memory and CPU it will reserve.
 - 🌳 **Serialized per git worktree** by default, so two agents in one checkout never run overlapping commands. `--serial-key none` opts out.
 - 🧠 **Estimates come from a real cache**: Welford mean + 0.5σ over `kind|tool|dirs|filecount`, cold-starting from per-kind defaults. `ajq stats` prints MAPE so the accuracy is checkable.
 - 🪟 **macOS cannot hard-cap a job's RAM** — no cgroup write access, and `RLIMIT_AS` breaks Node/JVM/Docker. The free-RAM admission gate does the work there and `ajq doctor` says so.

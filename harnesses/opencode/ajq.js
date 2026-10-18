@@ -159,7 +159,7 @@ async function guardMode() {
 async function classify(command) {
   const verdict = await spawn(["guard", "--explain", command], CLI_MS);
   if (field(verdict, "heavy") !== "true") return null;
-  return { kind: field(verdict, "kind") || "unknown" };
+  return { kind: field(verdict, "kind") || "unknown", suggest: field(verdict, "suggest") };
 }
 
 function isShellTool(tool) {
@@ -170,27 +170,30 @@ function commandOf(event) {
   return text(event && event.input && event.input.command);
 }
 
-// A shell-ish command keeps its metacharacters, so the suggestion needs
-// `--shell` and a quoted argument; otherwise the agent's own shell splits it.
-function submitSuggestion(command) {
+// The CLI owns the suggestion: it turns a `cd <dir> &&` prefix into `--cwd` and
+// adds `--shell` when the command needs a shell. Rebuilding it here would give
+// agents two different answers to the same question, so this is only the
+// fallback for a CLI whose `guard --explain` predates the `suggest:` line.
+function submitSuggestion(command, suggest) {
+  if (suggest) return suggest;
   if (/[|&;<>`]|\$\(/.test(command)) {
     return `ajq submit --shell -- "${command.replace(/"/g, '\\"')}"`;
   }
   return `ajq submit -- ${command}`;
 }
 
-function blockMessage(command, kind) {
+function blockMessage(command, kind, suggest) {
   return (
     `Blocked by ajq (hooks.guard_mode=block): '${command}' is classified ${kind} (heavy). ` +
-    `Submit it instead with the ajq_submit tool, or: ${submitSuggestion(command)} — then wait for it ` +
+    `Submit it instead with the ajq_submit tool, or: ${submitSuggestion(command, suggest)} — then wait for it ` +
     `with the ajq_wait tool (or a background 'ajq wait <id> --tail 80').`
   );
 }
 
-function warnNote(command, kind) {
+function warnNote(command, kind, suggest) {
   return (
     `ajq: '${command}' is classified ${kind} (heavy) and is expected to be slow. ` +
-    `Next time queue it instead: ${submitSuggestion(command)} — then wait for it with the ajq_wait tool ` +
+    `Next time queue it instead: ${submitSuggestion(command, suggest)} — then wait for it with the ajq_wait tool ` +
     `(or a background 'ajq wait <id> --tail 80'). Do not sleep or poll.`
   );
 }
@@ -395,8 +398,16 @@ function submitInput() {
   return {
     type: "object",
     properties: {
-      command: { type: "string", description: "Command to run, as a single shell-style string." },
-      cwd: { type: "string", description: "Working directory; defaults to the session directory." },
+      command: {
+        type: "string",
+        description:
+          "Command to run, as a single shell-style string. Do not prefix it with 'cd <dir> &&': pass cwd instead, so the job runs in one directory and the command stays readable in `ajq list`.",
+      },
+      cwd: {
+        type: "string",
+        description:
+          "Working directory; defaults to the session directory. Use this instead of a 'cd <dir> &&' prefix in the command.",
+      },
       kind: {
         type: "string",
         description: "build | test | typecheck | lint | format | install | docker | check. Omit for auto.",
@@ -522,7 +533,7 @@ export default {
           if (command === "" || command.includes("ajq")) return;
           const verdict = await classify(command);
           if (!verdict) return;
-          event.result = withNote(event.result, warnNote(command, verdict.kind));
+          event.result = withNote(event.result, warnNote(command, verdict.kind, verdict.suggest));
         } catch {
           /* never wedge the host */
         }
@@ -541,7 +552,7 @@ export default {
         const verdict = await classify(command);
         if (!verdict) return;
         if (!(await spawnOk(["daemon", "status"], CLI_MS))) return;
-        throw new Error(blockMessage(command, verdict.kind));
+        throw new Error(blockMessage(command, verdict.kind, verdict.suggest));
       });
     } catch {
       /* hook unsupported on this build */
