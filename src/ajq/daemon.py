@@ -825,7 +825,11 @@ class _Server:
     def _op_list(self, payload: dict) -> dict:
         states = _state_list(payload.get("states"))
         limit = _opt_int(payload.get("limit")) or 200
-        jobs = [self.enrich(job) for job in self.store.list_jobs(states=states, limit=limit)]
+        rows = self.store.list_jobs(states=states, limit=limit)
+        try:
+            jobs = self.scheduler.enrich_many(rows)
+        except Exception:
+            jobs = rows
         return {"ok": True, "jobs": jobs, "count": len(jobs)}
 
     def _op_cancel(self, payload: dict) -> dict:

@@ -175,8 +175,20 @@ SHELL_NAMES: frozenset[str] = frozenset({"sh", "bash", "zsh", "dash", "ksh", "as
 # `cd <dir> && ` at the start of a shell script, quoted or bare.
 _CD_PREFIX = re.compile(r"""^\s*cd\s+(?P<dir>'[^']*'|"[^"]*"|\S+)\s*&&\s*""")
 
+# A directory a shell must expand before it names a path.
+_EXPANDS = re.compile(r"[$`]")
+
 # Anything that only a shell can run: these need `ajq submit --shell`.
 _SHELLISH = re.compile(r"[|&;<>()`$*?]")
+
+
+def needs_script(command: str) -> bool:
+    """True when `command` must be classified as `sh -c <command>` rather than split.
+
+    shlex.split joins lines into one argv and strips the quotes around a
+    `cd "$DIR"` target, so both would produce a suggestion that runs something else.
+    """
+    return "\n" in command or bool(_EXPANDS.search(split_cd_prefix(command)[0]))
 
 
 def shell_script(argv: Sequence[str]) -> str | None:
@@ -204,7 +216,7 @@ def split_cd_prefix(command: str, limit: int = 4) -> tuple[str, str]:
         raw = match.group("dir")
         if len(raw) > 1 and raw[0] in "'\"" and raw[-1] == raw[0]:
             raw = raw[1:-1]
-        directory = raw
+        directory = os.path.join(directory, raw) if directory else raw
         rest = rest[match.end() :]
     return directory, rest
 
@@ -214,7 +226,7 @@ def strip_cd_args(argv: Sequence[str]) -> tuple[str, list[str]]:
     items = [str(item) for item in (argv or [])]
     directory = ""
     while len(items) >= 4 and items[0] == "cd" and items[2] == "&&":
-        directory = items[1]
+        directory = os.path.join(directory, items[1]) if directory else items[1]
         items = items[3:]
     return directory, items
 
@@ -243,6 +255,9 @@ def submit_line(argv: Sequence[str], pool: str | None = None) -> str:
     if script is not None:
         directory, body = split_cd_prefix(script)
         needs_shell = True
+        if _EXPANDS.search(directory):
+            # `--cwd` is not expanded by a shell, so `cd "$DIR" &&` stays in the script
+            directory, body = "", script
     else:
         directory, rest = strip_cd_args(items)
         words = rest if directory else items
@@ -258,6 +273,9 @@ def submit_line(argv: Sequence[str], pool: str | None = None) -> str:
         parts += ["--cwd", directory]
     if needs_shell:
         parts += ["--shell"]
+    if "\n" in body:
+        # a multi-line script must stay one argument, or the lines run as separate commands
+        body = shlex.quote(body)
     return f"{shlex.join(parts)} -- {body}"
 
 

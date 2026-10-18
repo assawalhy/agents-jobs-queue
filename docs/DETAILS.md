@@ -10,8 +10,9 @@ README covers what it is and how to install it.
 | Concurrency | `max_concurrent: 8` | Caps every pool at once |
 | Pools | `heavy 2 · normal 4 · service 3 · light 6` | One cap per tier; the tier comes from the job's kind and estimate |
 | Worktree serialization | `serial_key` = git worktree root | Two agents in one checkout never run overlapping commands |
-| Memory admission | `memory_headroom: 1.2` | A job starts only when `MemAvailable >= memory_limit × 1.2` |
-| Per-job memory | `memory_mb: 2048` (or `pool_memory_mb[pool]`) | Linux: cgroup `MemoryMax` + `MemorySwapMax=0` + `OOMPolicy=stop`. macOS: RSS watchdog kill (advisory) |
+| Memory admission | `memory_headroom: 1.2`, `swap_credit: 1.0` | A job starts only when `MemAvailable + zram credit >= memory_limit × 1.2`. With nothing running, the head job starts anyway |
+| Pressure gate | `admission: psi_memory_max 5, psi_cpu_max 70, temp_max_c 95` | While a job runs, no further job starts while PSI memory `full avg10`, PSI CPU `some avg10`, or the 30 s average CPU temperature is over its limit. Running jobs are never killed for it |
+| Per-job memory | `memory_mb: 2048` (or `pool_memory_mb[pool]`), `hard_factor: 1.5` | Linux, cgroup v2 with zram as the first swap: `MemoryHigh` at the cap (reclaim to zram, no kill), `MemoryMax` at cap × 1.5, `MemorySwapMax` at the cap. Otherwise `MemoryMax` at the cap with `MemorySwapMax=0`. `OOMPolicy=stop` in both. The RSS watchdog kills at the same ceiling as `MemoryMax` |
 | CPU | `cpu_percent: 200`, `nice: 10` | Linux: `CPUQuota` + `Nice`. Both: `setpriority` |
 | Timeout | `timeout_s: 1800` | SIGTERM to the process group, SIGKILL after `kill_grace_s` (10s), state `timeout` |
 | Output size | `max_output_bytes: 8 MiB` | Appends a truncation marker and terminates the job. `--keep-going-on-output` only stops recording |
@@ -22,7 +23,7 @@ Every guard is overridable per submit (`--timeout`, `--max-output-bytes`,
 `~/.config/ajq/config.json`. The config `resources` block is what the daemon
 builds its backend from. A job's memory cap is its `--memory-mb`, else
 `resources.pool_memory_mb[pool]`, else `resources.memory_mb`; that same number
-is the cgroup `MemoryMax` the job is given and the number admission is checked
+is the cgroup cap the job is given (`MemoryHigh` or `MemoryMax`, see below) and the number admission is checked
 against. Raise it for jobs that a plain `typecheck + coverage` run outgrows. The
 daemon must be restarted for a resource change to reach a running daemon (unlike
 `hooks.guard_mode`, which is cached).
@@ -133,10 +134,12 @@ Linux and macOS (POSIX). **No Windows.**
 
 | | Linux | macOS |
 | --- | --- | --- |
-| Execution | `systemd-run --user --scope` with `MemoryMax`, `MemorySwapMax=0`, `CPUQuota`, `Nice`, `OOMPolicy=stop` | direct spawn + `setpriority` |
+| Execution | `systemd-run --user --scope` with `MemoryHigh` + `MemoryMax` + `MemorySwapMax` (soft cap) or `MemoryMax` + `MemorySwapMax=0` (hard cap), `CPUQuota`, `Nice`, `OOMPolicy=stop` | direct spawn + `setpriority` |
 | Hard RAM cap | yes (cgroup v2) | **no** — advisory |
 | RSS sampling | `/proc/<pid>/status` | `ps -o rss=` |
-| Free memory | `/proc/meminfo` `MemAvailable` | `sysctl hw.memsize` + `vm_stat` |
+| Free memory | `/proc/meminfo` `MemAvailable` + zram credit from `/proc/swaps` and `/sys/block/zram*/mm_stat` | `sysctl hw.memsize` + `vm_stat` |
+| Soft memory cap | cgroup v2 with the memory controller delegated to `user@<uid>.service`, and zram as the first swap | no |
+| Pressure gate | `/proc/pressure/{memory,cpu}`, CPU sensor in `/sys/class/thermal` or `/sys/class/hwmon` | off |
 | Boot service | systemd user unit + linger | launchd agent |
 
 macOS cannot hard-cap a single process's memory: there is no cgroup write
@@ -208,7 +211,10 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
   "resources": {
     "memory_mb": 2048, "pool_memory_mb": {},
     "cpu_percent": 200, "nice": 10, "backend": "auto",
-    "memory_headroom": 1.2, "extra_args": []
+    "memory_headroom": 1.2, "swap_credit": 1.0,
+    "hard_factor": 1.5, "swap_mb": null,
+    "admission": { "psi_memory_max": 5, "psi_cpu_max": 70, "temp_max_c": 95 },
+    "extra_args": []
   },
   "estimates": {
     "enabled": true, "light_threshold_s": 30, "sigma_weight": 0.5,
@@ -233,12 +239,18 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
 | `defaults.priority` | 0 | Queue priority; higher first, FIFO within a priority |
 | `defaults.serial_key` | `auto` | Worktree serialization key; `auto` uses the git root, `none` opts out |
 | `defaults.shell` | false | Run the command through `sh -c` instead of argv |
-| `resources.memory_mb` | 2048 | Default per-job memory cap in MB, and the fallback for a pool absent from `pool_memory_mb` |
+| `resources.memory_mb` | 2048 | Default per-job memory cap in MB (cgroup cap and admission reservation), and the fallback for a pool absent from `pool_memory_mb` |
 | `resources.pool_memory_mb` | `{}` | Per-pool memory cap in MB, e.g. `{"heavy": 6144, "light": 1024}`; overrides `memory_mb` for that tier |
+| `resources.hard_factor` | 1.5 | Kill ceiling multiplier for the soft cap: `MemoryMax` and the RSS watchdog sit at cap × `hard_factor`. Ignored with the hard cap |
+| `resources.swap_mb` | null | null: soft cap with `MemorySwapMax` = cap when zram is the first swap, hard cap otherwise. A number > 0 forces the soft cap with that swap limit. 0 forces the hard cap |
+| `resources.swap_credit` | 1.0 | Fraction of the free zram credit added to `MemAvailable` for admission; 0 counts RAM only |
+| `resources.admission.psi_memory_max` | 5 | Hold new jobs while `/proc/pressure/memory` `full avg10` is above this percent, unless nothing is running; 0 disables |
+| `resources.admission.psi_cpu_max` | 70 | Hold new jobs while `/proc/pressure/cpu` `some avg10` is above this percent, unless nothing is running; 0 disables |
+| `resources.admission.temp_max_c` | 95 | Hold new jobs while the 30 s average CPU temperature is above this, unless nothing is running; 0 disables |
 | `resources.cpu_percent` | 200 | Linux `CPUQuota`; elsewhere the wall is advisory |
 | `resources.nice` | 10 | `Nice` in the scope, or a `nice` wrapper when the scope refuses it |
 | `resources.backend` | `auto` | `auto` / `linux` / `macos` / `posix` |
-| `resources.memory_headroom` | 1.2 | Admission needs `MemAvailable >= memory_mb × memory_headroom` |
+| `resources.memory_headroom` | 1.2 | Admission needs `MemAvailable + zram credit >= memory_mb × memory_headroom` |
 | `resources.extra_args` | `[]` | Extra arguments appended to `systemd-run` on Linux |
 | `estimates.enabled` | true | Record runtimes and serve estimates |
 | `estimates.light_threshold_s` | 30 | A cheap job estimated under this promotes to the light pool |
@@ -251,29 +263,45 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
 
 ### Memory, admission, and concurrency
 
-A job starts only when the box has room. `tick()` reads `MemAvailable` and
-admits a job when:
+`tick()` checks each queued job in queue order. A job starts when every check passes:
 
 ```
-MemAvailable >= job.memory_mb × resources.memory_headroom
+running < limits.max_concurrent
+pool running < limits.pools[job.pool]
+job.serial_key not running
+--- the checks below are skipped when ajq runs no job (progress rule) ---
+PSI memory full avg10 <= admission.psi_memory_max
+PSI cpu some avg10 <= admission.psi_cpu_max
+CPU temperature (30 s average) <= admission.temp_max_c
+MemAvailable + zram credit × swap_credit >= job.memory_mb × memory_headroom
 ```
 
-`job.memory_mb` is the `--memory-mb` override, else
-`resources.pool_memory_mb[job.pool]`, else `resources.memory_mb`. The same number
-is the cgroup `MemoryMax` on Linux, so the cap the kernel enforces is the cap
-admission reserved. Inside one tick, each admitted job subtracts its own
-`memory_mb` from the free figure before the next is tested, so N jobs of size M
-on one reading need about `M × (N - 1 + headroom)` free.
+`job.memory_mb` is the `--memory-mb` override, else `resources.pool_memory_mb[job.pool]`, else `resources.memory_mb`.
+Inside one tick, each admitted job subtracts its own `memory_mb` from the budget before the next is tested, so N jobs of size M on one reading need about `M × (N - 1 + headroom)` of budget.
 
-A pool cap is a ceiling, not a promise. `limits.pools.heavy: 2` runs two heavy
-jobs only when the memory gate admits both. Raising `resources.memory_mb`, or a
-pool's value, lowers concurrency for every job that shares it, so charge the 6 GB
-build its 6 GB through `pool_memory_mb` and leave the lint a smaller reservation.
+The zram credit is the RAM that swapping more pages to zram can still free: for each zram swap device, `(disksize - orig_data_size) × (1 - mem_used_total / orig_data_size)`, limited by the device's `mem_limit`.
+The credit is 0 when any disk swap has a higher priority than zram, because the kernel would page to disk first.
+Disk swap adds no credit, because swapping to disk is what makes the desktop stall.
 
-Swap does not count. Linux jobs run with `MemorySwapMax=0`, and admission reads
-`MemAvailable` only, so a job cannot borrow box swap. A job that grows past its
-cap is OOM-killed with or without swap. Lower `memory_headroom` only as a
-deliberate trade of throughput for OOM margin.
+Memory PSI uses the `full` line (every non-idle task stalled on memory), because `some` also rises when the kernel throttles one ajq job at its `MemoryHigh`, and that would hold unrelated light jobs.
+
+The progress rule exists because a static reservation can exceed what the box will ever free while other programs hold memory.
+Without it, a 6144 MB heavy cap at headroom 1.2 needs 7373 MB of budget, and on a desktop with 5 GB `MemAvailable` the heavy pool never starts.
+With it, the head job starts whenever ajq runs nothing, whatever the readings say.
+
+The pressure gate only holds new jobs. A running job is never killed for PSI or temperature.
+`ajq list` and `ajq status` show the first failing check as `blocked`, e.g. `memory 7373>5446MB`, `pool heavy 2/2`, `temp 97C>95C`.
+`ajq doctor` prints the current PSI, CPU temperature and zram credit next to their limits.
+
+On Linux the cap takes one of two forms.
+
+- Soft cap: cgroup v2 with the memory controller delegated to the user manager, and zram as the highest-priority swap (or `resources.swap_mb` > 0). The cap is `MemoryHigh`. Past it the kernel throttles the scope and reclaims its pages to zram, so a job that slightly outgrows its cap slows down instead of failing. `MemoryMax` at `memory_mb × hard_factor` is the hard ceiling where `OOMPolicy=stop` stops the scope, and `MemorySwapMax` limits the job's swap to `memory_mb` (or `swap_mb`).
+- Hard cap: everywhere else. `MemoryMax` is the cap and `MemorySwapMax=0`, so the job is stopped at the cap. Without swap, `MemoryHigh` would throttle the job until its timeout, and with disk swap first it would page the desktop. `resources.swap_mb: 0` forces this form.
+
+cgroup v1 and hybrid hierarchies (RHEL 7, Debian 10, Ubuntu 18.04 and 20.04 by default) ignore `MemoryHigh` and `MemorySwapMax`, and a user manager often has no memory controller there. `ajq doctor` prints `cgroup v2 memory no` and a note, and the RSS watchdog at the cap is the enforcement.
+On macOS and on `linux-posix-fallback` the RSS watchdog kills at the cap, the same number admission reserves.
+
+A pool cap is a ceiling, not a promise. `limits.pools.heavy: 2` runs two heavy jobs only when the memory and pressure checks admit both.
 
 Environment overrides: `AJQ_MAX_CONCURRENT`, `AJQ_POOL`, `AJQ_TIMEOUT_S`,
 `AJQ_MAX_OUTPUT_BYTES`, `AJQ_GUARD_MODE`, `AJQ_MEMORY_MB`, `AJQ_CPU_PERCENT`,
@@ -370,5 +398,7 @@ rebuilding produces the same GIF; no CSS keyframe animations are involved.
 
 - macOS has no hard per-process RAM cap; the admission gate plus an RSS watchdog
   is the protection. `ajq doctor` states this.
+- macOS has no PSI or portable CPU temperature source, so the pressure gate is off there.
+- The admission reservation is the static cap, not the job's measured peak, so a small job in a big-cap pool reserves more than it uses.
 - Kilo / Kimi / DeepSeek / Cursor get the skill but no hooks.
 - The `pi` binary in use is a Go port without a JS extension loader.

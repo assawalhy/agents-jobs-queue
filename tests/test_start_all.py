@@ -57,6 +57,11 @@ PLAN = {
 def make_scheduler(self, **overrides):
     store = helpers.store()
     self.addCleanup(store.close)
+    overrides["resources"] = {
+        "swap_credit": 0,
+        "admission": {"psi_memory_max": 0, "psi_cpu_max": 0, "temp_max_c": 0},
+        **overrides.get("resources", {}),
+    }
     config = helpers.load_config(**overrides)
     backend = MacosBackend()
     runner = JobRunner(backend, poll_interval=0.05)
@@ -144,7 +149,9 @@ class TestStartAllExecution(helpers.AjqTestCase):
 
     def test_start_all_ignores_the_memory_admission_gate(self):
         scheduler, _ = make_scheduler(self, resources={"memory_headroom": 100000})
-        job = scheduler.submit(argv=SLEEP, cwd=subdir(self.state_dir, "a"), pool="heavy")
+        first = scheduler.submit(argv=SLEEP, cwd=subdir(self.state_dir, "a"), pool="heavy")
+        self.assertEqual(scheduler.tick(), [first["id"]])
+        job = scheduler.submit(argv=SLEEP, cwd=subdir(self.state_dir, "b"), pool="heavy")
         self.assertEqual(scheduler.tick(), [])
         self.assertEqual(scheduler.start_all_plan()["startable"], 1)
         self.assertEqual(scheduler.start_all()["started"], [job["id"]])
@@ -202,6 +209,21 @@ class StartCase(helpers.AjqTestCase):
         finally:
             sys.stdin = original_stdin
         return code, buffer.getvalue()
+
+
+class TestSubmitCwd(StartCase):
+    def submitted_cwd(self, *flags):
+        self.cli._request = lambda payload, *args, **kwargs: (
+            self.requests.append(payload) or {"ok": True, "job": {"id": "j-1", "state": "queued"}}
+        )
+        self.run_cli(["submit", *flags, "--", "true"])
+        return self.requests[-1]["cwd"]
+
+    def test_a_relative_cwd_is_resolved_by_the_client(self):
+        self.assertEqual(self.submitted_cwd("--cwd", "sub"), os.path.join(os.getcwd(), "sub"))
+
+    def test_no_cwd_sends_the_client_cwd(self):
+        self.assertEqual(self.submitted_cwd(), os.getcwd())
 
 
 class TestStartParsing(unittest.TestCase):

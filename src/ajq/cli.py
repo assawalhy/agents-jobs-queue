@@ -238,6 +238,8 @@ def _print_job_line(job: dict) -> None:
     if state.startswith("queued"):
         parts.append(_tail("eta_start " + _short(job.get("eta_start_s")), 20))
         parts.append(_tail("eta_run " + _short(job.get("eta_run_s")), 17))
+        if job.get("blocked"):
+            parts.append(f"blocked {job['blocked']}")
     else:
         parts.append(_tail("eta_run " + _short(job.get("eta_run_s")), 17))
     parts.append(_tail("out " + _bytes(job.get("out_bytes")), 12))
@@ -329,8 +331,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
         _fail("nothing to run: ajq submit -- pytest -q")
         return 1
     payload: dict[str, Any] = {"op": "submit", "argv": argv, "shell": bool(args.shell)}
-    if args.cwd:
-        payload["cwd"] = args.cwd
+    # The daemon resolves a relative path against its own cwd ($HOME or /), so
+    # the client resolves it, and sends its own cwd when none is given.
+    payload["cwd"] = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else os.getcwd()
     if args.kind:
         payload["kind"] = args.kind
     if args.pool:
@@ -452,6 +455,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
                 _tail("est", 9),
                 _tail("eta_start", 10),
                 _cell("out", 6),
+                _cell("blocked", 22),
                 "cmd",
             )
         )
@@ -478,6 +482,7 @@ def _list_row(job: dict, cmd_width: int) -> str:
             _tail(_short(job.get("est_seconds")), 9),
             _tail(eta_start, 10),
             _cell(_bytes(job.get("out_bytes")), 6),
+            _cell((job.get("blocked") or "-") if queued else "-", 22),
             _trim(_cmd_text(job), cmd_width),
         )
     )
@@ -869,7 +874,7 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         _fail('nothing to explain: ajq guard --explain "npm run build"')
         return 1
     try:
-        argv = shlex.split(command)
+        argv = ["sh", "-c", command] if guard_mod.needs_script(command) else shlex.split(command)
     except ValueError as exc:
         _fail(f"cannot parse command: {exc}")
         return 1
@@ -957,6 +962,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         "total_memory_mb": platform.total_memory_mb(),
         "available_memory_mb": platform.available_memory_mb(),
         "cpu_count": platform.cpu_count(),
+        "zram_credit_mb": platform.zram_credit_mb(),
+        "psi_memory": platform.psi_avg10("memory", "full"),
+        "psi_cpu": platform.psi_avg10("cpu", "some"),
+        "cgroup_v2_memory": platform.cgroup_v2_memory(),
+        "zram_primary_swap": platform.zram_is_primary_swap(),
+        "cpu_temp_c": platform.cpu_temp_c(),
+        "admission": config.get("resources.admission"),
         "guard_mode": config.get("hooks.guard_mode"),
         "max_concurrent": config.get("limits.max_concurrent"),
         "kill_grace_s": config.get("defaults.kill_grace_s"),
@@ -973,6 +985,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         report["linger"] = _linger()
         if not report["linger"].startswith("yes"):
             report["notes"].append("linger=no: ajqd only starts at login")
+        if not report["cgroup_v2_memory"]:
+            report["notes"].append(
+                "no cgroup v2 memory controller for the user manager: MemoryMax may be ignored, the RSS watchdog is the cap"
+            )
     else:
         report["launchd_label"] = daemon.PLIST_LABEL
         report["launchd_state"] = _launchd_state()
@@ -1001,13 +1017,29 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(
         f"memory  total {report['total_memory_mb']}M"
         f"  available {report['available_memory_mb']}M"
+        f"  zram credit {report['zram_credit_mb']}M"
         f"  cpus {report['cpu_count']}"
+    )
+    if platform.IS_LINUX:
+        print(
+            f"cgroup  v2 memory {'yes' if report['cgroup_v2_memory'] else 'no'}"
+            f"  zram first swap {'yes' if report['zram_primary_swap'] else 'no'}"
+        )
+    gates = report["admission"] if isinstance(report["admission"], dict) else {}
+    print(
+        f"pressure psi-mem {_reading(report['psi_memory'], '%')}/{gates.get('psi_memory_max', '-')}"
+        f"  psi-cpu {_reading(report['psi_cpu'], '%')}/{gates.get('psi_cpu_max', '-')}"
+        f"  cpu temp {_reading(report['cpu_temp_c'], 'C')}/{gates.get('temp_max_c', '-')}"
     )
     print(f"guard   mode {report['guard_mode']}  max_concurrent {report['max_concurrent']}")
     print(f"log     {_tildify(report['log_path'])}")
     for note in report["notes"]:
         print(f"note    {note}")
     return 0
+
+
+def _reading(value: Any, unit: str) -> str:
+    return "-" if value is None else f"{value:.0f}{unit}"
 
 
 def _linger() -> str:

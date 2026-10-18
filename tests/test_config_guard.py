@@ -199,6 +199,21 @@ class TestGuard(unittest.TestCase):
         self.assertNotIn("--cwd", text)
         self.assertIn("--shell -- for i in 1 2 3; do cargo test; done", text)
 
+    def test_a_cd_chain_joins_relative_directories(self):
+        text = guard.explain(["cd", "apps", "&&", "cd", "web", "&&", "npm", "run", "build"])
+        self.assertIn("ajq submit --cwd apps/web -- npm run build", text)
+
+    def test_a_cd_into_a_variable_stays_in_the_script(self):
+        self.assertTrue(guard.needs_script('cd "$DIR" && npm run build'))
+        text = guard.explain(["sh", "-c", 'cd "$DIR" && npm run build'])
+        self.assertIn('ajq submit --shell -- cd "$DIR" && npm run build', text)
+        self.assertNotIn("--cwd", text)
+
+    def test_a_multi_line_script_is_one_quoted_argument(self):
+        self.assertTrue(guard.needs_script("npm run build\necho done"))
+        text = guard.explain(["sh", "-c", "npm run build\necho done"])
+        self.assertIn("ajq submit --shell -- 'npm run build\necho done'", text)
+
     def test_submit_line_quotes_a_directory_with_a_space(self):
         line = guard.submit_line(["cd", "/work/with space/app", "&&", "npm", "run", "build"])
         self.assertEqual(line, "ajq submit --cwd '/work/with space/app' -- npm run build")

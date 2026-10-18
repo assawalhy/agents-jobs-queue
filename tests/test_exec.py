@@ -205,6 +205,53 @@ class TestBackends(helpers.AjqTestCase):
             command = backend.command({"id": "j-wd2", "cwd": bad}, ["true"])
             self.assertFalse([c for c in command if c.startswith("--working-directory=")])
 
+    def _linux(self, cgroup_v2=True, **kwargs):
+        from ajq.backends.linux import LinuxBackend
+
+        backend = LinuxBackend(**kwargs)
+        backend._fallback = None
+        backend.cgroup_v2_memory = cgroup_v2
+        return backend
+
+    def test_linux_soft_cap_when_zram_is_the_first_swap(self):
+        from unittest import mock
+
+        with mock.patch.object(platform, "zram_is_primary_swap", return_value=True):
+            command = self._linux().command({"id": "j-mem", "memory_mb": 6144}, ["true"])
+            self.assertIn("MemoryHigh=6144M", command)
+            self.assertIn("MemoryMax=9216M", command)
+            self.assertIn("MemorySwapMax=6144M", command)
+            self.assertEqual(JobRunner(self._linux()).memory_limit_mb_for({"memory_mb": 200}), 300)
+
+    def test_linux_hard_cap_without_zram_first_or_without_cgroup_v2(self):
+        from unittest import mock
+
+        cases = (
+            (False, True, {}),
+            (True, False, {}),
+            (True, True, {"swap_mb": 0}),
+        )
+        for zram_first, cgroup_v2, kwargs in cases:
+            with mock.patch.object(platform, "zram_is_primary_swap", return_value=zram_first):
+                backend = self._linux(cgroup_v2=cgroup_v2, **kwargs)
+                command = backend.command({"id": "j-mem", "memory_mb": 2048}, ["true"])
+                self.assertIn("MemoryMax=2048M", command)
+                self.assertIn("MemorySwapMax=0", command)
+                self.assertFalse([c for c in command if c.startswith("MemoryHigh=")])
+                self.assertEqual(JobRunner(backend).memory_limit_mb_for({"memory_mb": 200}), 200)
+
+    def test_linux_explicit_swap_mb_sets_the_swap_limit(self):
+        command = self._linux(hard_factor=2.0, swap_mb=512).command({"id": "j-mem"}, ["true"])
+        self.assertIn("MemoryHigh=2048M", command)
+        self.assertIn("MemoryMax=4096M", command)
+        self.assertIn("MemorySwapMax=512M", command)
+
+    def test_posix_runner_kills_at_the_cap(self):
+        from ajq.backends.macos import MacosBackend
+
+        runner = JobRunner(MacosBackend(hard_factor=1.5))
+        self.assertEqual(runner.memory_limit_mb_for({"memory_mb": 200}), 200)
+
     def test_get_backend_rejects_nonsense(self):
         from ajq.backends import get_backend
 
@@ -262,6 +309,84 @@ class TestDaemonResourceWiring(helpers.AjqTestCase):
             if server.store is not None:
                 server.store.close()
 
+
+class TestPressureProbes(unittest.TestCase):
+    MIB = 1024 * 1024
+
+    def _host(self, files, dirs=None):
+        from unittest import mock
+
+        dirs = dirs or {}
+        return (
+            mock.patch.object(platform, "IS_LINUX", True),
+            mock.patch.object(platform, "_read_text", side_effect=lambda path: files.get(path, "")),
+            mock.patch.object(platform.os, "listdir", side_effect=lambda path: dirs.get(path, [])),
+        )
+
+    def _zram(self, swaps, mem_limit=0):
+        mib = self.MIB
+        return {
+            "/proc/swaps": "Filename Type Size Used Priority\n" + swaps,
+            "/sys/block/zram0/disksize": str(16384 * mib),
+            "/sys/block/zram0/mm_stat": f"{4096 * mib} {900 * mib} {1024 * mib} {mem_limit * mib} 0 0 0 0 0",
+        }
+
+    def test_zram_credit_counts_free_space_times_the_saving(self):
+        linux, read, listdir = self._host(self._zram("/dev/zram0 partition 1 1 5\n/var/swapfile file 1 1 -2\n"))
+        with linux, read, listdir:
+            self.assertTrue(platform.zram_is_primary_swap())
+            self.assertEqual(platform.zram_credit_mb(), 9216)
+
+    def test_zram_credit_respects_mem_limit(self):
+        linux, read, listdir = self._host(self._zram("/dev/zram0 partition 1 1 5\n", mem_limit=2048))
+        with linux, read, listdir:
+            self.assertEqual(platform.zram_credit_mb(), 3072)
+
+    def test_zram_credit_is_zero_when_disk_swap_comes_first(self):
+        linux, read, listdir = self._host(self._zram("/dev/zram0 partition 1 1 5\n/dev/sda2 partition 1 1 10\n"))
+        with linux, read, listdir:
+            self.assertFalse(platform.zram_is_primary_swap())
+            self.assertEqual(platform.zram_credit_mb(), 0)
+
+    def test_zram_device_name_is_matched_exactly(self):
+        files = self._zram("/dev/zram10 partition 1 1 5\n")
+        linux, read, listdir = self._host(files)
+        with linux, read, listdir:
+            self.assertEqual(platform.zram_credit_mb(), 0)
+
+    def test_psi_reads_the_requested_line(self):
+        linux, read, listdir = self._host({
+            "/proc/pressure/memory": "some avg10=12.50 avg60=1.00 avg300=0.10 total=1\n"
+                                     "full avg10=3.00 avg60=0.00 avg300=0.00 total=1\n",
+        })
+        with linux, read, listdir:
+            self.assertEqual(platform.psi_avg10("memory", "some"), 12.5)
+            self.assertEqual(platform.psi_avg10("memory", "full"), 3.0)
+            self.assertIsNone(platform.psi_avg10("io"))
+
+    def test_cpu_temp_prefers_the_k10temp_die_reading(self):
+        files = {
+            "/sys/class/hwmon/hwmon0/name": "k10temp\n",
+            "/sys/class/hwmon/hwmon0/temp1_input": "95000",
+            "/sys/class/hwmon/hwmon0/temp1_label": "Tctl",
+            "/sys/class/hwmon/hwmon0/temp2_input": "75000",
+            "/sys/class/hwmon/hwmon0/temp2_label": "Tdie",
+            "/sys/class/hwmon/hwmon1/name": "nvme\n",
+            "/sys/class/hwmon/hwmon1/temp1_input": "99000",
+        }
+        dirs = {
+            "/sys/class/hwmon": ["hwmon0", "hwmon1"],
+            "/sys/class/hwmon/hwmon0": ["name", "temp1_input", "temp1_label", "temp2_input", "temp2_label"],
+        }
+        linux, read, listdir = self._host(files, dirs)
+        with linux, read, listdir:
+            self.assertEqual(platform.cpu_temp_c(), 75.0)
+
+    def test_cpu_temp_reads_intel_package_zone(self):
+        files = {"/sys/class/thermal/thermal_zone3/type": "x86_pkg_temp\n", "/sys/class/thermal/thermal_zone3/temp": "81000"}
+        linux, read, listdir = self._host(files, {"/sys/class/thermal": ["thermal_zone3"]})
+        with linux, read, listdir:
+            self.assertEqual(platform.cpu_temp_c(), 81.0)
 
 if __name__ == "__main__":
     unittest.main()
