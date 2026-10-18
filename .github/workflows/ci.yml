@@ -18,6 +18,10 @@ jobs:
         run: |
           bash -n install.sh
           for hook in hooks/*.sh; do sh -n "$hook"; done
+      - name: Syntax-check the opencode plugin
+        run: node --check harnesses/opencode/ajq.js
+      - name: Run the opencode plugin smoke test
+        run: node --test tests/*.test.mjs
       - name: Byte-compile the package
         run: python3 -m compileall -q src/ajq
       - name: Run tests
