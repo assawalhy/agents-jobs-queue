@@ -8,7 +8,9 @@
 //      "warn", append a note pointing the model at `ajq submit`
 //   3. on `execute.before`, when hooks.guard_mode is "block", deny a heavy shell
 //      command with a reason naming `ajq submit`
-//   4. register `ajq_submit` / `ajq_status` so the model can queue work without a shell
+//   4. register `ajq_submit` / `ajq_status` / `ajq_output` / `ajq_wait` /
+//      `ajq_cancel` so the model can queue, check, read, wait for and kill work
+//      without a shell
 //
 // The V2 shell tool is named "shell" (V1 called it "bash"); both are accepted.
 // Classification stays in Python (`ajq guard --explain`) — one source of truth.
@@ -23,6 +25,9 @@ import { execFile } from "node:child_process";
 
 const CLI_MS = 15000;
 const ENSURE_MS = 4000;
+// `ajq cancel` waits for the job to die (bounded by its kill grace), so it can
+// outlive the plain CLI budget.
+const CANCEL_MS = 30000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
 // V2 renamed the shell tool from "bash" to "shell"; accept both so a version
@@ -81,6 +86,28 @@ function spawnOk(args, ms) {
   });
 }
 
+// Like spawn(), but keeps stdout even when the command exits non-zero — `ajq
+// wait` exits 2 for any non-`done` state and still prints the state and log.
+function spawnText(args, ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(""), ms);
+    if (typeof timer === "object" && timer && typeof timer.unref === "function") timer.unref();
+    try {
+      execFile(ajqBin(), args, { timeout: ms, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (_err, stdout) => {
+        done(typeof stdout === "string" ? stdout : "");
+      });
+    } catch {
+      done("");
+    }
+  });
+}
+
 // `ajq list --json` is `{"count": N, "jobs": [ ... ]}`; each job carries exactly
 // one `"state": "..."` pair, so a substring count is enough.
 function countStates(listing, wanted) {
@@ -132,7 +159,7 @@ async function guardMode() {
 async function classify(command) {
   const verdict = await spawn(["guard", "--explain", command], CLI_MS);
   if (field(verdict, "heavy") !== "true") return null;
-  return { kind: field(verdict, "kind") || "unknown" };
+  return { kind: field(verdict, "kind") || "unknown", suggest: field(verdict, "suggest") };
 }
 
 function isShellTool(tool) {
@@ -143,28 +170,31 @@ function commandOf(event) {
   return text(event && event.input && event.input.command);
 }
 
-// A shell-ish command keeps its metacharacters, so the suggestion needs
-// `--shell` and a quoted argument; otherwise the agent's own shell splits it.
-function submitSuggestion(command) {
+// The CLI owns the suggestion: it turns a `cd <dir> &&` prefix into `--cwd` and
+// adds `--shell` when the command needs a shell. Rebuilding it here would give
+// agents two different answers to the same question, so this is only the
+// fallback for a CLI whose `guard --explain` predates the `suggest:` line.
+function submitSuggestion(command, suggest) {
+  if (suggest) return suggest;
   if (/[|&;<>`]|\$\(/.test(command)) {
     return `ajq submit --shell -- "${command.replace(/"/g, '\\"')}"`;
   }
   return `ajq submit -- ${command}`;
 }
 
-function blockMessage(command, kind) {
+function blockMessage(command, kind, suggest) {
   return (
     `Blocked by ajq (hooks.guard_mode=block): '${command}' is classified ${kind} (heavy). ` +
-    `Submit it instead with the ajq_submit tool, or: ${submitSuggestion(command)} — then inspect it with ` +
-    `ajq_status (or 'ajq status <id> --json') and read it with 'ajq output <id>'.`
+    `Submit it instead with the ajq_submit tool, or: ${submitSuggestion(command, suggest)} — then wait for it ` +
+    `with the ajq_wait tool (or a background 'ajq wait <id> --tail 80').`
   );
 }
 
-function warnNote(command, kind) {
+function warnNote(command, kind, suggest) {
   return (
     `ajq: '${command}' is classified ${kind} (heavy) and is expected to be slow. ` +
-    `Next time queue it instead: ${submitSuggestion(command)} — then check it with 'ajq status <id> --json' ` +
-    `and read the captured output with 'ajq output <id>'.`
+    `Next time queue it instead: ${submitSuggestion(command, suggest)} — then wait for it with the ajq_wait tool ` +
+    `(or a background 'ajq wait <id> --tail 80'). Do not sleep or poll.`
   );
 }
 
@@ -183,13 +213,40 @@ function withNote(result, note) {
 const SUBMIT_DESCRIPTION =
   "Queue a heavy command (build, test, typecheck, lint, install, docker build, or anything " +
   "expected to take more than ~30s) on the ajq jobs daemon instead of running it in the shell. " +
-  "Call this whenever the next step would otherwise be a slow bash command. Returns the job id; " +
-  "follow it with ajq_status.";
+  "Call this whenever the next step would otherwise be a slow bash command. A cheap job is waited " +
+  "out and returns its state and log in this same call; anything longer returns the job id to " +
+  "follow with ajq_wait (or a background `ajq wait`).";
 
 const STATUS_DESCRIPTION =
-  "Read an ajq job: state (queued/running/done/failed/timeout/canceled/lost), queue position, " +
-  "ETAs and the tail of its captured output. Call this after ajq_submit instead of sleeping or " +
-  "polling by hand.";
+  "Read an ajq job's state only (queued/running/done/failed/timeout/canceled/lost). It does not " +
+  "return the log: use ajq_output to read the log, or ajq_wait to block until the job finishes " +
+  "and get the log in one call. Never poll it in a loop.";
+
+const OUTPUT_DESCRIPTION =
+  "Read an ajq job's captured output: the tail by default, the first lines with head, or any " +
+  "window with offset. Use it once ajq_status shows a terminal state; to wait for that and get " +
+  "the log in one call, use ajq_wait instead.";
+
+const CANCEL_DESCRIPTION =
+  "Cancel (kill) a queued or running ajq job. A queued job is removed at once; a running one is " +
+  "SIGTERMed and SIGKILLed after its grace period, and this call waits (bounded) for it to die so " +
+  "you get the final state. Pass wait: false to return as soon as it is signalled.";
+
+const WAIT_DESCRIPTION =
+  "Wait for an ajq job to finish and return its final state plus the tail of its output in one " +
+  "call. Runs in-process, so it is not the shell's 120s timeout. Call this instead of polling " +
+  "ajq_status or sleeping. For a job that may outlast a turn, run `ajq wait <id> --tail N` as a " +
+  "background shell task instead, so the session stays interactive.";
+
+// A runaway `tail` (a model can pass one while trying to wait) must never read
+// the whole log; clamp to a sane number of lines.
+const MAX_TAIL = 1000;
+
+function clampTail(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(MAX_TAIL, Math.max(0, Math.trunc(n)));
+}
 
 // The session directory is what the job must run in; the tool executor context
 // carries no cwd on V2, so read it from Session.Info.location, then ctx.location.
@@ -207,11 +264,23 @@ async function sessionDirectory(ctx, context) {
   return text(ctx && ctx.location && ctx.location.directory);
 }
 
+// Seconds `ajq_submit` will block for a cheap job before handing the id back.
+// Long enough to cover a lint/format/check, short enough that a real build never
+// sits inside a blocking tool call. `wait_s: 0` opts out.
+const SUBMIT_WAIT_S = 20;
+const SUBMIT_WAIT_MAX_S = 120;
+
+function clampWaitS(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return value === 0 || raw === 0 ? 0 : SUBMIT_WAIT_S;
+  return Math.min(Math.trunc(raw), SUBMIT_WAIT_MAX_S);
+}
+
 async function runSubmit(ctx, args, context) {
   try {
     const command = text(args.command);
     if (command === "") return { content: "ajq_submit: command is required" };
-    const cliArgs = ["submit"];
+    const cliArgs = ["--json", "submit"];
     if (text(args.label) !== "") cliArgs.push("--label", text(args.label));
     if (text(args.kind) !== "") cliArgs.push("--kind", text(args.kind));
     if (Number(args.timeout) > 0) cliArgs.push("--timeout", String(Math.trunc(Number(args.timeout))));
@@ -223,8 +292,32 @@ async function runSubmit(ctx, args, context) {
     // --shell hands the single string to $SHELL in the daemon, so pipes, &&,
     // globs and env prefixes behave the way the model wrote them.
     cliArgs.push("--shell", "--", command);
-    const out = text(await spawn(cliArgs, CLI_MS));
-    return { content: out === "" ? `ajq_submit: no output from ajq for ${command}` : out };
+    const waitS = clampWaitS(args.wait_s);
+    // JSON carries the id and the daemon's estimate, so the id never has to be
+    // scraped back out of the human line and the wait can be gated on it.
+    const raw = text(await spawn(cliArgs, CLI_MS));
+    let job = null;
+    try {
+      job = JSON.parse(raw);
+    } catch {
+      job = null;
+    }
+    if (!job || !job.id) {
+      // The job is already queued; never submit twice. Hand back whatever the
+      // CLI printed so the id can still be read out of it.
+      return { content: raw === "" ? `ajq_submit: no output from ajq for ${command}` : raw };
+    }
+    const etaTotal = Number(job.eta_start_s) + Number(job.eta_run_s);
+    if (waitS > 0 && Number.isFinite(etaTotal) && etaTotal <= waitS) {
+      const waited = text(
+        await spawnText(["wait", String(job.id), "--tail", "40", "--timeout", String(waitS)], (waitS + 15) * 1000),
+      );
+      // `ajq wait` already leads with the id; do not print it twice.
+      if (waited !== "") {
+        return { content: waited.startsWith(String(job.id)) ? waited : `${job.id}  ${waited}` };
+      }
+    }
+    return { content: `${job.id}  state ${text(job.state)}  pool ${text(job.pool)}  eta_run ${Math.round(Number(job.eta_run_s))}s` };
   } catch (err) {
     return { content: `ajq_submit failed: ${err && err.message ? err.message : String(err)}` };
   }
@@ -235,19 +328,69 @@ async function runStatus(args) {
     const id = text(args.id);
     if (id === "") return { content: "ajq_status: id is required" };
     const meta = await spawn(["status", id, "--json"], CLI_MS);
-    let state = "";
+    let job = null;
     try {
-      state = text(JSON.parse(meta).state);
+      job = JSON.parse(meta);
     } catch {
-      state = "";
+      job = null;
     }
-    const tailArgs = Number(args.tail) > 0 ? ["--tail", String(Math.trunc(Number(args.tail)))] : [];
-    const log = text(await spawn(["output", id, ...tailArgs], CLI_MS));
-    return {
-      content: [state === "" ? meta.trim() : `state ${state}`, log === "" ? "(no output yet)" : log].join("\n"),
-    };
+    if (!job || !job.state) return { content: `ajq_status: no such job ${id}` };
+    const parts = [`state ${text(job.state)}`];
+    if (job.queue_position) parts.push(`position ${job.queue_position}`);
+    if (job.exit_code !== null && job.exit_code !== undefined) parts.push(`exit ${job.exit_code}`);
+    if (text(job.kill_reason) !== "") parts.push(`killed ${text(job.kill_reason)}`);
+    return { content: parts.join("  ") };
   } catch (err) {
     return { content: `ajq_status failed: ${err && err.message ? err.message : String(err)}` };
+  }
+}
+
+async function runOutput(args) {
+  try {
+    const id = text(args.id);
+    if (id === "") return { content: "ajq_output: id is required" };
+    const cliArgs = ["output", id];
+    if (args.from_start === true) {
+      cliArgs.push("--from-start");
+    } else if (args.head !== undefined && args.head !== null) {
+      cliArgs.push("--head", String(clampTail(args.head, 40)));
+    } else {
+      cliArgs.push("--tail", String(clampTail(args.tail, 40)));
+    }
+    const offset = clampTail(args.offset, 0);
+    if (offset > 0) cliArgs.push("--offset", String(offset));
+    const out = text(await spawnText(cliArgs, CLI_MS));
+    return { content: out === "" ? `ajq_output: ${id} has no output` : out };
+  } catch (err) {
+    return { content: `ajq_output failed: ${err && err.message ? err.message : String(err)}` };
+  }
+}
+
+async function runCancel(args) {
+  try {
+    const id = text(args.id);
+    if (id === "") return { content: "ajq_cancel: id is required" };
+    const cliArgs = ["cancel", id];
+    if (args.wait === false) cliArgs.push("--no-wait");
+    const out = text(await spawnText(cliArgs, CANCEL_MS));
+    return { content: out === "" ? `ajq_cancel: no output for ${id}` : out };
+  } catch (err) {
+    return { content: `ajq_cancel failed: ${err && err.message ? err.message : String(err)}` };
+  }
+}
+
+async function runWait(args) {
+  try {
+    const id = text(args.id);
+    if (id === "") return { content: "ajq_wait: id is required" };
+    const tail = clampTail(args.tail, 40);
+    const timeout = Number(args.timeout) > 0 ? Math.trunc(Number(args.timeout)) : 120;
+    const out = text(
+      await spawnText(["wait", id, "--tail", String(tail), "--timeout", String(timeout)], (timeout + 15) * 1000),
+    );
+    return { content: out === "" ? `ajq_wait: no output for ${id}` : out };
+  } catch (err) {
+    return { content: `ajq_wait failed: ${err && err.message ? err.message : String(err)}` };
   }
 }
 
@@ -255,13 +398,27 @@ function submitInput() {
   return {
     type: "object",
     properties: {
-      command: { type: "string", description: "Command to run, as a single shell-style string." },
-      cwd: { type: "string", description: "Working directory; defaults to the session directory." },
+      command: {
+        type: "string",
+        description:
+          "Command to run, as a single shell-style string. Do not prefix it with 'cd <dir> &&': pass cwd instead, so the job runs in one directory and the command stays readable in `ajq list`.",
+      },
+      cwd: {
+        type: "string",
+        description:
+          "Working directory; defaults to the session directory. Use this instead of a 'cd <dir> &&' prefix in the command.",
+      },
       kind: {
         type: "string",
         description: "build | test | typecheck | lint | format | install | docker | check. Omit for auto.",
       },
       timeout: { type: "number", description: "Seconds before the job is killed. Omit for the config default." },
+      wait_s: {
+        type: "number",
+        description:
+          "Seconds to wait for a cheap job and return its state and log in this same call " +
+          `(default ${SUBMIT_WAIT_S}, max ${SUBMIT_WAIT_MAX_S}, 0 to return the id immediately).`,
+      },
       label: { type: "string", description: "Short name shown by `ajq list`." },
       priority: { type: "number", description: "Higher runs first inside a pool." },
     },
@@ -275,7 +432,49 @@ function statusInput() {
     type: "object",
     properties: {
       id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  };
+}
+
+function outputInput() {
+  return {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
       tail: { type: "number", description: "Trailing log lines to return; omit for 40." },
+      head: { type: "number", description: "First N lines instead of the tail." },
+      offset: { type: "number", description: "Skip the first N lines, then take tail/head." },
+      from_start: { type: "boolean", description: "Return the whole log, not just the tail." },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  };
+}
+
+function cancelInput() {
+  return {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
+      wait: {
+        type: "boolean",
+        description: "Wait for the job to die and return its final state; omit for true.",
+      },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  };
+}
+
+function waitInput() {
+  return {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Job id, e.g. j-1a2b3c4d5e6f." },
+      tail: { type: "number", description: "Trailing log lines to return; omit for 40." },
+      timeout: { type: "number", description: "Seconds to wait before returning the current state; omit for 120." },
     },
     required: ["id"],
     additionalProperties: false,
@@ -301,6 +500,24 @@ export default {
           input: statusInput(),
           execute: (args) => runStatus(args),
         });
+        editor.add({
+          name: "ajq_output",
+          description: OUTPUT_DESCRIPTION,
+          input: outputInput(),
+          execute: (args) => runOutput(args),
+        });
+        editor.add({
+          name: "ajq_wait",
+          description: WAIT_DESCRIPTION,
+          input: waitInput(),
+          execute: (args) => runWait(args),
+        });
+        editor.add({
+          name: "ajq_cancel",
+          description: CANCEL_DESCRIPTION,
+          input: cancelInput(),
+          execute: (args) => runCancel(args),
+        });
       });
     } catch {
       /* the host rejects the tool set; the guard still works */
@@ -316,7 +533,7 @@ export default {
           if (command === "" || command.includes("ajq")) return;
           const verdict = await classify(command);
           if (!verdict) return;
-          event.result = withNote(event.result, warnNote(command, verdict.kind));
+          event.result = withNote(event.result, warnNote(command, verdict.kind, verdict.suggest));
         } catch {
           /* never wedge the host */
         }
@@ -335,7 +552,7 @@ export default {
         const verdict = await classify(command);
         if (!verdict) return;
         if (!(await spawnOk(["daemon", "status"], CLI_MS))) return;
-        throw new Error(blockMessage(command, verdict.kind));
+        throw new Error(blockMessage(command, verdict.kind, verdict.suggest));
       });
     } catch {
       /* hook unsupported on this build */

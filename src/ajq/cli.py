@@ -35,6 +35,7 @@ from .store import TERMINAL_STATES
 DAEMON_FREE = frozenset({"daemon", "version", "config", "guard"})
 _POLL_S = 0.2
 _READ_CHUNK = 65536
+_CMD_WIDTH = 48
 _CONFIG_SUMMARY_KEYS = (
     "limits.max_concurrent",
     "limits.pools",
@@ -86,20 +87,30 @@ def _project(payload: Any, names: list[str]) -> Any:
         }
     if not isinstance(payload, dict):
         return payload
-    return {name: payload.get(name) for name in names}
+    selected: dict[str, Any] = {}
+    for name in names:
+        value = payload.get(name)
+        if value is None and name == "cmd" and "argv" in payload:
+            # `cmd` is how ajq renders a command, not a daemon key, so it is
+            # derived here instead of being shipped in every list payload.
+            value = _cmd_text(payload)
+        selected[name] = value
+    return selected
 
 
 def _print_fields(payload: Any, names: list[str]) -> None:
-    """One line, `key=value` pairs: the cheapest thing for an agent to read."""
+    """One line, `key=value` pairs: the cheapest thing for an agent to read.
+
+    Each row goes through `_project` so this form and `--json` answer the same
+    question: a derived key such as `cmd` must not read `-` here and carry a
+    value there.
+    """
     if isinstance(payload, dict) and "jobs" in payload:
-        for job in payload["jobs"]:
-            print(" ".join(f"{name}={_scalar(job.get(name))}" for name in names))
-        return
-    if isinstance(payload, list):
-        for job in payload:
-            print(" ".join(f"{name}={_scalar(job.get(name))}" for name in names))
-        return
-    print(" ".join(f"{name}={_scalar(payload.get(name))}" for name in names))
+        rows = [_project(job, names) for job in payload["jobs"]]
+    else:
+        rows = [_project(item, names) for item in payload] if isinstance(payload, list) else [_project(payload, names)]
+    for row in rows:
+        print(" ".join(f"{name}={_scalar(row.get(name))}" for name in names))
 
 
 def _scalar(value: Any) -> str:
@@ -158,16 +169,49 @@ def _tail(value: Any, width: int) -> str:
     return text if len(text) >= width else text.rjust(width)
 
 
-def _cmd_of(job: dict) -> str:
+def _trim(text: str, width: int) -> str:
+    """Cut `text` to `width` characters, ending in `...` when it did not fit.
+
+    `width` 0 or less means no cut. The suffix is part of the width, so a
+    trimmed column never shifts the ones after it.
+    """
+    if width <= 0 or len(text) <= width:
+        return text
+    return text[: width - 3].rstrip() + "..."
+
+
+def _argv_of(job: dict) -> list[str]:
+    """A job's argv as a list, whether the payload carried it as JSON text."""
     argv = job.get("argv") or []
     if isinstance(argv, str):
         try:
             argv = json.loads(argv)
         except ValueError:
             argv = [argv]
-    if not argv:
-        return "(no command)"
-    return shlex.join(str(item) for item in argv)
+    return [str(item) for item in argv]
+
+
+def _cmd_of(job: dict) -> str:
+    """The exact argv of a job, joined for display."""
+    argv = _argv_of(job)
+    return shlex.join(argv) if argv else "(no command)"
+
+
+def _cmd_text(job: dict) -> str:
+    """The command as ajq shows it: identification, not exact argv.
+
+    A shell job is shown as its script with a leading `cd <dir> &&` chain
+    dropped. Agents and harnesses submit `sh -c 'cd <worktree> && <command>'`,
+    and that wrapper is longer than half a table column, so every row would
+    read `/bin/sh -c 'cd /home/...`. The daemon already runs the job in its own
+    cwd, and the exact argv stays in `--json` and in `status --verbose`.
+    """
+    argv = _argv_of(job)
+    script = guard_mod.shell_script(argv)
+    if script is not None:
+        _, body = guard_mod.split_cd_prefix(script)
+        return body or "(no command)"
+    return shlex.join(argv) if argv else "(no command)"
 
 
 def _pool_of(job: dict) -> str:
@@ -194,6 +238,8 @@ def _print_job_line(job: dict) -> None:
     if state.startswith("queued"):
         parts.append(_tail("eta_start " + _short(job.get("eta_start_s")), 20))
         parts.append(_tail("eta_run " + _short(job.get("eta_run_s")), 17))
+        if job.get("blocked"):
+            parts.append(f"blocked {job['blocked']}")
     else:
         parts.append(_tail("eta_run " + _short(job.get("eta_run_s")), 17))
     parts.append(_tail("out " + _bytes(job.get("out_bytes")), 12))
@@ -202,7 +248,13 @@ def _print_job_line(job: dict) -> None:
 
 def _print_job_block(job: dict) -> None:
     _print_job_line(job)
-    details = [f"cmd {_cmd_of(job)}"]
+    shown = _cmd_text(job)
+    details = [f"cmd {shown}"]
+    raw = _cmd_of(job)
+    if raw != shown:
+        # the render above dropped a wrapper or a cd prefix; keep the exact argv
+        # one line away for anyone debugging what really ran
+        details.append(f"raw {raw}")
     if job.get("kind") and job.get("kind") != "auto":
         details.append(f"kind {job['kind']}")
     if job.get("serial_key"):
@@ -279,8 +331,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
         _fail("nothing to run: ajq submit -- pytest -q")
         return 1
     payload: dict[str, Any] = {"op": "submit", "argv": argv, "shell": bool(args.shell)}
-    if args.cwd:
-        payload["cwd"] = args.cwd
+    # The daemon resolves a relative path against its own cwd ($HOME or /), so
+    # the client resolves it, and sends its own cwd when none is given.
+    payload["cwd"] = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else os.getcwd()
     if args.kind:
         payload["kind"] = args.kind
     if args.pool:
@@ -391,40 +444,48 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not jobs:
         print("no jobs" if not args.state else "no jobs match")
         return 0
-    header = "  ".join(
-        (
-            _cell("id", 15),
-            _cell("state", 9),
-            _cell("pool", 8),
-            _cell("kind", 10),
-            _tail("elapsed", 8),
-            _tail("est", 9),
-            _tail("eta_start", 10),
-            "out",
-        )
-    )
-    print(header)
-    for job in jobs:
-        state = _state_of(job)
-        queued = state == "queued"
-        if queued and job.get("queue_position"):
-            state = f"queued#{job['queue_position']}"
-        eta_start = _short(job.get("eta_start_s")) if queued else "-"
-        print(
-            "  ".join(
-                (
-                    _cell(job.get("id"), 15),
-                    _cell(state, 9),
-                    _cell(job.get("pool"), 8),
-                    _cell(job.get("kind"), 10),
-                    _tail(_short(job.get("elapsed_s")), 8),
-                    _tail(_short(job.get("est_seconds")), 9),
-                    _tail(eta_start, 10),
-                    _bytes(job.get("out_bytes")),
-                )
+    print(
+        "  ".join(
+            (
+                _cell("id", 15),
+                _cell("state", 9),
+                _cell("pool", 8),
+                _cell("kind", 10),
+                _tail("elapsed", 8),
+                _tail("est", 9),
+                _tail("eta_start", 10),
+                _cell("out", 6),
+                _cell("blocked", 22),
+                "cmd",
             )
         )
+    )
+    for job in jobs:
+        print(_list_row(job, args.cmd_width))
     return 0
+
+
+def _list_row(job: dict, cmd_width: int) -> str:
+    """One `ajq list` row: fixed columns first, the trimmed command last."""
+    state = _state_of(job)
+    queued = state == "queued"
+    if queued and job.get("queue_position"):
+        state = f"queued#{job['queue_position']}"
+    eta_start = _short(job.get("eta_start_s")) if queued else "-"
+    return "  ".join(
+        (
+            _cell(job.get("id"), 15),
+            _cell(state, 9),
+            _cell(job.get("pool"), 8),
+            _cell(job.get("kind"), 10),
+            _tail(_short(job.get("elapsed_s")), 8),
+            _tail(_short(job.get("est_seconds")), 9),
+            _tail(eta_start, 10),
+            _cell(_bytes(job.get("out_bytes")), 6),
+            _cell((job.get("blocked") or "-") if queued else "-", 22),
+            _trim(_cmd_text(job), cmd_width),
+        )
+    )
 
 
 def _open_out(job: dict, create: bool = False):
@@ -462,12 +523,27 @@ def _cmd_output(args: argparse.Namespace) -> int:
             sys.stdout.write(handle.read())
         else:
             lines = handle.read().splitlines()
-            tail = lines[-args.tail :] if args.tail > 0 else []
-            if tail:
-                sys.stdout.write("\n".join(tail) + "\n")
+            window = _output_window(lines, args.offset, args.head, args.tail)
+            if window:
+                sys.stdout.write("\n".join(window) + "\n")
     finally:
         handle.close()
     return 0
+
+
+def _output_window(lines: list[str], offset: int, head: int | None, tail: int) -> list[str]:
+    """The lines `ajq output` prints: a head, an offset window, or the tail.
+
+    With no offset, `--tail` keeps its "last N" meaning; with an offset it
+    becomes "the next N after the offset", so `--offset 100 --tail 50` is the
+    window [100, 150). `--head` always counts from the offset.
+    """
+    offset = max(0, offset or 0)
+    if head is not None:
+        return lines[offset : offset + head] if head > 0 else []
+    if offset:
+        return lines[offset : offset + tail] if tail > 0 else []
+    return lines[-tail:] if tail > 0 else []
 
 
 def _follow(job: dict, handle, args: argparse.Namespace) -> int:
@@ -499,13 +575,45 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
     job = _job_or_fail(_request({"op": "cancel", "id": args.id}))
     if not job:
         return 1
+    # A queued job is terminal the moment cancel returns; a running one is only
+    # signalled, so wait (bounded by its kill grace) for the real terminal state
+    # instead of reporting "running" and lying about the kill.
+    if not args.no_wait and _state_of(job) not in TERMINAL_STATES:
+        waited = _wait_for(args.id, _grace_of(job) + 2.0)
+        if waited:
+            job = waited
+    state = _state_of(job)
     if args.json:
         _emit(job)
-        return 0
-    print(f"{job.get('id')}  {_state_of(job)}")
+        return 0 if state in TERMINAL_STATES else 2
+    print(f"{job.get('id')}  {state}")
     if job.get("kill_reason"):
         print(f"kill_reason {job['kill_reason']}")
-    return 0
+    if job.get("signal"):
+        print(f"signal {job['signal']}")
+    return 0 if state in TERMINAL_STATES else 2
+
+
+def _grace_of(job: dict) -> float:
+    """A job's SIGTERM→SIGKILL grace, defaulting to the config default."""
+    try:
+        grace = float(job.get("kill_grace_s") or 0)
+    except (TypeError, ValueError):
+        grace = 0.0
+    return grace if grace > 0 else 10.0
+
+
+def _job_tail(job: dict, count: int) -> list[str]:
+    """The last `count` lines of a job's captured output, or [] when absent."""
+    if not count or count <= 0:
+        return []
+    out_path = job.get("out_path") or paths.job_out_path(str(job.get("id") or ""))
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    return lines[-count:]
 
 
 def _cmd_wait(args: argparse.Namespace) -> int:
@@ -513,6 +621,7 @@ def _cmd_wait(args: argparse.Namespace) -> int:
     if job is None:
         _fail(f"job {args.id} is not known to the daemon")
         return 2
+    tail = _job_tail(job, getattr(args, "tail", 0))
     names = _field_names(getattr(args, "fields", None))
     if names:
         if args.json:
@@ -521,11 +630,16 @@ def _cmd_wait(args: argparse.Namespace) -> int:
             _print_fields(job, names)
         return 0 if job.get("state") == "done" else 2
     if args.json:
-        _emit(job)
+        payload = dict(job)
+        if tail:
+            payload["tail"] = tail
+        _emit(payload)
     else:
         print(f"{job.get('id')}  {_state_of(job)}  elapsed {_short(job.get('elapsed_s'))}")
         if job.get("kill_reason"):
             print(f"kill_reason {job['kill_reason']}")
+        for line in tail:
+            print(line)
     return 0 if job.get("state") == "done" else 2
 
 
@@ -546,17 +660,22 @@ def _row_sigma(row: dict) -> float:
     return 0.0
 
 
+def _confirm(question: str) -> bool:
+    """`[y/N]` on stdin; an EOF (no tty, empty stdin) counts as no."""
+    try:
+        answer = input(question).strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in {"y", "yes"}
+
+
 def _cmd_prune(args: argparse.Namespace) -> int:
     """Delete finished jobs (and their output) so the queue stays readable."""
     days = 0 if args.delete_all else max(0, int(args.older_than_days))
     if not args.json and not args.yes:
         what = "every finished job" if args.delete_all else f"finished jobs older than {days}d"
         files = "" if args.keep_files else " and their captured output"
-        try:
-            answer = input(f"delete {what}{files}? [y/N] ").strip().lower()
-        except EOFError:
-            answer = ""
-        if answer not in {"y", "yes"}:
+        if not _confirm(f"delete {what}{files}? [y/N] "):
             print("cancelled")
             return 0
     response = _request(
@@ -575,6 +694,122 @@ def _cmd_prune(args: argparse.Namespace) -> int:
     scope = "all finished jobs" if args.delete_all else f"older than {days}d"
     print(f"removed {removed} job(s) {scope}" + ("" if args.keep_files else " and their output"))
     return 0
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    """Start every queued job now, after showing what that costs the machine.
+
+    Caps and the memory admission gate are bypassed; the worktree serial key is
+    not, unless `--ignore-serial`. The plan comes from the daemon, so the numbers
+    shown are resolved with the same per-job memory and CPU rules the start uses.
+    """
+    ignore_serial = bool(args.ignore_serial)
+    width = args.cmd_width
+    inspected = _request({"op": "start_all", "dry_run": True, "ignore_serial": ignore_serial})
+    if not _ok(inspected):
+        return 1
+    plan = inspected.get("plan") or {}
+    if not int(plan.get("total") or 0):
+        if args.json:
+            _emit({"plan": plan, "started": [], "jobs": []})
+        else:
+            print("no queued jobs")
+        return 0
+    if args.json and not args.yes:
+        _emit({"plan": plan, "started": [], "jobs": []})
+        return 0
+    if not args.json:
+        _print_start_plan(plan, width)
+    if not int(plan.get("startable") or 0):
+        # Every queued job shares a worktree with another. Prompting here would
+        # ask for a yes that starts nothing, so name the flag instead.
+        print(
+            "nothing to start: every queued job shares a worktree with another "
+            "(--ignore-serial starts them anyway)"
+        )
+        return 0
+    if args.dry_run:
+        if not args.json:
+            print("dry run: nothing started")
+        return 0
+    if not args.json and not args.yes and not _confirm("start them anyway? [y/N] "):
+        print("cancelled")
+        return 0
+    started = _request({"op": "start_all", "ignore_serial": ignore_serial})
+    if not _ok(started):
+        return 1
+    jobs = started.get("jobs") or []
+    if args.json:
+        _emit(
+            {
+                "plan": started.get("plan") or plan,
+                "started": started.get("started") or [],
+                "jobs": jobs,
+            }
+        )
+        return 0
+    print(f"started {len(jobs)} job(s)")
+    for job in jobs:
+        print("  " + _list_row(job, width))
+    return 0
+
+
+def _print_start_plan(plan: dict, cmd_width: int) -> None:
+    startable = int(plan.get("startable") or 0)
+    total = int(plan.get("total") or 0)
+    blocked = int(plan.get("blocked_by_serial") or 0)
+    memory = int(plan.get("memory_mb") or 0)
+    available = int(plan.get("available_memory_mb") or 0)
+    total_memory = int(plan.get("total_memory_mb") or 0)
+    cpu = int(plan.get("cpu_percent") or 0)
+    cpus = int(plan.get("cpu_count") or 0)
+    print(
+        f"{startable} of {total} queued job(s) start now, over the pool caps, "
+        f"max_concurrent {plan.get('max_concurrent')} and the memory admission gate"
+    )
+    if blocked:
+        print(
+            f"serial  {blocked} job(s) stay queued: their worktree already runs one "
+            "(--ignore-serial starts them too)"
+        )
+    ratio = f"{memory / available:.1f}x" if available else "no free memory"
+    print(
+        f"memory  {memory}MB reserved against {available}MB available "
+        f"({total_memory}MB total, {ratio} available)"
+    )
+    print(f"cpu     {cpu}% against {cpus * 100}% ({cpus} cpus)")
+    counts = plan.get("pool_counts") or {}
+    caps = plan.get("pool_caps") or {}
+    if counts or caps:
+        tiers = sorted(set(counts) | set(caps))
+        print(
+            "pools   "
+            + ", ".join(f"{tier} {counts.get(tier, 0)}/{caps.get(tier, plan.get('max_concurrent'))}" for tier in tiers)
+        )
+    print(
+        "note    every job keeps its own memory and CPU cap, so the risk is "
+        "aggregate pressure; a job the kernel kills reports failed with kill_reason memory_limit"
+    )
+    for job in plan.get("jobs") or []:
+        print(
+            "  ".join(
+                (
+                    "job",
+                    _cell(job.get("id"), 15),
+                    _cell(job.get("pool"), 8),
+                    _tail(f"{int(job.get('memory_mb') or 0)}MB", 8),
+                    _tail(f"{int(job.get('cpu_percent') or 0)}%", 6),
+                    _trim(_cmd_text(job), cmd_width),
+                )
+            )
+        )
+    if available and memory > available:
+        print(
+            f"risk    reserved memory is {memory - available}MB over available: "
+            "the kernel can OOM-kill jobs in this burst"
+        )
+    if cpus and cpu > cpus * 100:
+        print(f"risk    CPU demand is {cpu - cpus * 100}% over the machine: this burst will be oversubscribed")
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -639,7 +874,7 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         _fail('nothing to explain: ajq guard --explain "npm run build"')
         return 1
     try:
-        argv = shlex.split(command)
+        argv = ["sh", "-c", command] if guard_mod.needs_script(command) else shlex.split(command)
     except ValueError as exc:
         _fail(f"cannot parse command: {exc}")
         return 1
@@ -727,6 +962,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         "total_memory_mb": platform.total_memory_mb(),
         "available_memory_mb": platform.available_memory_mb(),
         "cpu_count": platform.cpu_count(),
+        "zram_credit_mb": platform.zram_credit_mb(),
+        "psi_memory": platform.psi_avg10("memory", "full"),
+        "psi_cpu": platform.psi_avg10("cpu", "some"),
+        "cgroup_v2_memory": platform.cgroup_v2_memory(),
+        "zram_primary_swap": platform.zram_is_primary_swap(),
+        "cpu_temp_c": platform.cpu_temp_c(),
+        "admission": config.get("resources.admission"),
         "guard_mode": config.get("hooks.guard_mode"),
         "max_concurrent": config.get("limits.max_concurrent"),
         "kill_grace_s": config.get("defaults.kill_grace_s"),
@@ -743,6 +985,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         report["linger"] = _linger()
         if not report["linger"].startswith("yes"):
             report["notes"].append("linger=no: ajqd only starts at login")
+        if not report["cgroup_v2_memory"]:
+            report["notes"].append(
+                "no cgroup v2 memory controller for the user manager: MemoryMax may be ignored, the RSS watchdog is the cap"
+            )
     else:
         report["launchd_label"] = daemon.PLIST_LABEL
         report["launchd_state"] = _launchd_state()
@@ -771,13 +1017,29 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(
         f"memory  total {report['total_memory_mb']}M"
         f"  available {report['available_memory_mb']}M"
+        f"  zram credit {report['zram_credit_mb']}M"
         f"  cpus {report['cpu_count']}"
+    )
+    if platform.IS_LINUX:
+        print(
+            f"cgroup  v2 memory {'yes' if report['cgroup_v2_memory'] else 'no'}"
+            f"  zram first swap {'yes' if report['zram_primary_swap'] else 'no'}"
+        )
+    gates = report["admission"] if isinstance(report["admission"], dict) else {}
+    print(
+        f"pressure psi-mem {_reading(report['psi_memory'], '%')}/{gates.get('psi_memory_max', '-')}"
+        f"  psi-cpu {_reading(report['psi_cpu'], '%')}/{gates.get('psi_cpu_max', '-')}"
+        f"  cpu temp {_reading(report['cpu_temp_c'], 'C')}/{gates.get('temp_max_c', '-')}"
     )
     print(f"guard   mode {report['guard_mode']}  max_concurrent {report['max_concurrent']}")
     print(f"log     {_tildify(report['log_path'])}")
     for note in report["notes"]:
         print(f"note    {note}")
     return 0
+
+
+def _reading(value: Any, unit: str) -> str:
+    return "-" if value is None else f"{value:.0f}{unit}"
 
 
 def _linger() -> str:
@@ -830,6 +1092,23 @@ def _cmd_version(args: argparse.Namespace) -> int:
 # -- parser ---------------------------------------------------------------
 
 
+def _tail_count(value: str) -> int:
+    """`--tail` line count. Accepts `80`, `4e+24` or `1.5e3`; never negative.
+
+    A model can pass a scientific-notation or absurd tail while trying to read
+    output; parse it instead of failing (argparse's `int` rejects `4e+24`), and
+    cap it so the slice stays sane.
+    """
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        try:
+            count = int(float(value))
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"invalid tail: {value!r}") from None
+    return max(0, min(count, 1_000_000))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ajq",
@@ -869,6 +1148,17 @@ def _build_parser() -> argparse.ArgumentParser:
             action="append",
             metavar="A,B,C",
             help="only these keys, e.g. --fields state,elapsed_s,out_bytes",
+        )
+
+    def add_cmd_width(child: argparse.ArgumentParser) -> None:
+        """How much of a command the human tables show."""
+        child.add_argument(
+            "--cmd-width",
+            dest="cmd_width",
+            type=int,
+            default=_CMD_WIDTH,
+            metavar="N",
+            help=f"characters of the command to show, 0 for all (default {_CMD_WIDTH})",
         )
 
     submit = add("submit", "queue a command for the daemon to run", _cmd_submit)
@@ -923,20 +1213,53 @@ def _build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--state", action="append", metavar="STATE", help="filter by state (repeatable)")
     listing.add_argument("--limit", type=int, default=50, help="max rows (default 50)")
     add_fields(listing)
+    add_cmd_width(listing)
+
+    start = add(
+        "start",
+        "start every queued job now, over the caps, after a resource prompt",
+        _cmd_start,
+        aliases=("start-all",),
+    )
+    start.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    start.add_argument(
+        "--dry-run", action="store_true", help="show the resource cost and what would start, then exit"
+    )
+    start.add_argument(
+        "--ignore-serial",
+        action="store_true",
+        help="also start jobs that share a worktree with another job",
+    )
+    add_cmd_width(start)
 
     output = add("output", "print a job's captured output", _cmd_output, aliases=("logs",))
     output.add_argument("id", help="job id")
-    output.add_argument("--tail", type=int, default=40, metavar="N", help="last N lines (default 40)")
+    output.add_argument("--tail", type=_tail_count, default=40, metavar="N", help="last N lines (default 40)")
+    output.add_argument("--head", type=_tail_count, default=None, metavar="N", help="first N lines instead of the tail")
+    output.add_argument("--offset", type=_tail_count, default=0, metavar="N", help="skip the first N lines, then take --tail/--head")
     output.add_argument("--follow", "-f", action="store_true", help="stream until the job is terminal")
     output.add_argument("--from-start", action="store_true", help="show the whole log, not the tail")
     output.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up following after S")
 
-    cancel = add("cancel", "cancel a queued or running job", _cmd_cancel)
+    cancel = add("cancel", "cancel a queued or running job", _cmd_cancel, aliases=("kill",))
     cancel.add_argument("id", help="job id")
+    cancel.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="return as soon as the job is signalled, without waiting for it to die",
+    )
 
     wait = add("wait", "block until a job is terminal", _cmd_wait)
     wait.add_argument("id", help="job id")
     wait.add_argument("--timeout", dest="timeout_s", type=float, metavar="S", help="give up after S")
+    wait.add_argument(
+        "--tail",
+        "-n",
+        type=_tail_count,
+        default=0,
+        metavar="N",
+        help="also print the last N lines of output (one call: state + log)",
+    )
     add_fields(wait)
 
     stats = add("stats", "estimate table and MAPE accuracy", _cmd_stats)

@@ -41,7 +41,8 @@ else
 fi
 
 json_string() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        | awk 'NR > 1 { printf "\\n" } { gsub(/\t/, "\\t"); printf "%s", $0 }'
 }
 
 if [ -t 0 ]; then
@@ -81,7 +82,9 @@ command="$(printf '%s' "$payload" | awk '
             c = substr(s, 1, 1)
             if (c == "\\") {
                 n = substr(s, 2, 1)
-                if (n == "n" || n == "t" || n == "r") out = out " "
+                if (n == "n") out = out "\n"
+                else if (n == "t") out = out "\t"
+                else if (n == "r") out = out ""
                 else if (n == "u") { out = out "?"; s = substr(s, 7); continue }
                 else out = out n
                 s = substr(s, 3)
@@ -121,22 +124,23 @@ if [ "$mode" = "off" ]; then
     exit 0
 fi
 
-# A shell-ish command has to keep its metacharacters, so it needs --shell and a
-# quoted argument; otherwise the agent's own shell would split the line anyway.
-# Flags always go before `--`, so the tail is built separately from them.
-tail="-- $command"
-case "$command" in
-    *'|'* | *'&&'* | *';'* | *'>'* | *'<'* | *'`'* | *'$('*)
-        tail="--shell -- \"$command\""
-        ;;
-esac
-suggest="ajq submit $tail"
-note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Then check it with 'ajq status <id> --json', block on it with 'ajq wait <id>', and read the captured output with 'ajq output <id>'."
+# The CLI owns the suggestion: it turns a `cd <dir> &&` prefix into `--cwd`,
+# adds `--shell` when the command needs a shell, and quotes the tail. Rebuilding
+# that here would give agents two different answers to the same question.
+# `suggest:` is the last field and may span lines (a quoted multi-line script).
+suggest="$(printf '%s\n' "$verdict" | sed -n '/^suggest:/,$p' | sed '1s/^suggest:[[:space:]]*//')"
+if [ -z "$suggest" ]; then
+    # an older ajq CLI prints no suggestion; still warn or block
+    quoted="$(printf '%s' "$command" | sed "s/'/'\\\\''/g")"
+    suggest="ajq submit --shell -- '$quoted'"
+fi
+tail="${suggest#ajq submit }"
+note="ajq: '$command' is classified ${kind} (heavy) and is expected to be slow. Run it through the jobs queue instead: ${suggest}. Prefer '--cwd <dir>' over a 'cd <dir> &&' prefix. Then wait for it with 'ajq wait <id> --tail 80' — background that call so the session stays interactive; it returns the final state and the log in one call. Do not sleep or poll."
 
 if [ "$mode" = "block" ]; then
     # Never deny a tool call on a machine whose queue is not answering.
     run "$ajq" daemon status >/dev/null 2>&1 || exit 0
-    reason="Blocked by ajq (hooks.guard_mode=block): '$command' is classified ${kind} (heavy). Submit it instead: ajq submit --label <name> [--timeout <seconds>] [--max-output-bytes <n>] $tail — then inspect it with 'ajq status <id> --json' and 'ajq output <id>'."
+    reason="Blocked by ajq (hooks.guard_mode=block): '$command' is classified ${kind} (heavy). Submit it instead: ajq submit --label <name> [--timeout <seconds>] [--max-output-bytes <n>] $tail — then wait for it with 'ajq wait <id> --tail 80' (background that call; one call returns the final state and the log)."
     esc="$(json_string "$reason")"
     case "$HARNESS" in
         kiro)

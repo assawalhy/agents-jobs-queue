@@ -26,6 +26,7 @@ function makeStub() {
     bin,
     `#!/usr/bin/env bash
 cmd="\${1:-}"; shift || true
+if [ "\$cmd" = "--json" ]; then cmd="\${1:-}"; shift || true; fi
 case "$cmd" in
   config)
     if [ "\${1:-}" = "--json" ]; then
@@ -37,6 +38,7 @@ case "$cmd" in
     shift || true
     if printf '%s' "$*" | grep -qE 'npm test|pytest|heavy'; then
       printf 'heavy: true\\nkind: test\\n'
+      [ -n "\${STUB_SUGGEST:-}" ] && printf 'suggest: %s\\n' "\${STUB_SUGGEST}"
     else
       printf 'heavy: false\\nkind: unknown\\n'
     fi ;;
@@ -46,9 +48,13 @@ case "$cmd" in
     fi ;;
   list)
     [ -n "\${STUB_LIST:-}" ] && printf '%s\\n' "\${STUB_LIST}" ;;
-  submit) printf 'j-test123\\n' ;;
+  submit)
+    printf '{"id":"j-test123","state":"queued","pool":"light","eta_start_s":%s,"eta_run_s":%s}\\n' "\${STUB_ETA_START:-0}" "\${STUB_ETA_RUN:-2}" ;;
   status) printf '{"state":"running"}\\n' ;;
-  output) printf 'some log output\\n' ;;
+  output)
+    if [ -n "\${STUB_OUTPUT_EMPTY:-}" ]; then exit 0; else printf 'output-args: %s\\n' "$*"; fi ;;
+  cancel) printf 'cancel-args: %s\\n' "$*" ;;
+  wait) printf 'state done\\nlog line one\\nlog line two\\n' ;;
 esac
 exit 0
 `,
@@ -101,6 +107,8 @@ async function load(mode, extraEnv = {}) {
   process.env.STUB_MODE = mode;
   delete process.env.STUB_DAEMON;
   delete process.env.STUB_LIST;
+  delete process.env.STUB_OUTPUT_EMPTY;
+  delete process.env.STUB_SUGGEST;
   Object.assign(process.env, extraEnv);
   const url = `${pathToFileURL(PLUGIN.pathname).href}?t=${Math.random()}`;
   const mod = await import(url);
@@ -116,7 +124,7 @@ test("setup registers the native tools", async () => {
   const { tools } = await load("warn");
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["ajq_status", "ajq_submit"],
+    ["ajq_cancel", "ajq_output", "ajq_status", "ajq_submit", "ajq_wait"],
   );
 });
 
@@ -153,6 +161,34 @@ test("block denies a heavy shell command", async () => {
   );
 });
 
+// The suggestion has one owner: `ajq guard --explain`. The plugin must repeat
+// it, `--cwd` and all, rather than rebuild its own line from the raw command.
+test("warn repeats the CLI suggestion verbatim", async () => {
+  const { hooks } = await load("warn", { STUB_SUGGEST: "ajq submit --cwd /work/app --shell -- npm test" });
+  const event = heavyEvent();
+  await hooks["execute.after"](event);
+  const texts = event.result.content.map((c) => c.text).join("\n");
+  assert.ok(
+    texts.includes("queue it instead: ajq submit --cwd /work/app --shell -- npm test — then wait"),
+    texts,
+  );
+});
+
+test("block repeats the CLI suggestion verbatim", async () => {
+  const { hooks } = await load("block", { STUB_SUGGEST: "ajq submit --cwd /work/app -- npm test" });
+  await assert.rejects(
+    () => Promise.resolve(hooks["execute.before"]({ tool: "shell", input: { command: "npm test" } })),
+    /or: ajq submit --cwd \/work\/app -- npm test — then wait/,
+  );
+});
+
+test("an older CLI without a suggest line still gets a nudge", async () => {
+  const { hooks } = await load("warn");
+  const event = heavyEvent();
+  await hooks["execute.after"](event);
+  assert.match(event.result.content.map((c) => c.text).join("\n"), /Next time queue it instead: ajq submit --/);
+});
+
 test("block allows light commands", async () => {
   const { hooks } = await load("block");
   await hooks["execute.before"]({ tool: "shell", input: { command: "git status" } });
@@ -173,16 +209,104 @@ test("the V1 tool name 'bash' is still accepted", async () => {
 test("ajq_submit runs submit with the session directory", async () => {
   const { tools } = await load("warn");
   const submit = tools.find((t) => t.name === "ajq_submit");
-  const out = await submit.execute({ command: "npm test" }, { sessionID: "ses_x" });
+  const out = await submit.execute({ command: "npm test", wait_s: 0 }, { sessionID: "ses_x" });
   assert.match(out.content, /j-test123/);
 });
 
-test("ajq_status reads state and output", async () => {
+test("ajq_submit returns state and log in one call for a cheap job", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint" }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.match(out.content, /state done/);
+  assert.match(out.content, /log line two/);
+});
+
+test("ajq_submit hands back the id without waiting for a slow job", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "600" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm test" }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.match(out.content, /eta_run 600s/);
+  assert.doesNotMatch(out.content, /log line two/);
+});
+
+test("ajq_submit does not wait on a job that is still queued behind others", async () => {
+  const { tools } = await load("warn", { STUB_ETA_START: "300", STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint" }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.doesNotMatch(out.content, /state done/);
+});
+
+test("ajq_submit wait_s 0 opts out of waiting", async () => {
+  const { tools } = await load("warn", { STUB_ETA_RUN: "2" });
+  const submit = tools.find((t) => t.name === "ajq_submit");
+  const out = await submit.execute({ command: "npm run lint", wait_s: 0 }, { sessionID: "ses_x" });
+  assert.match(out.content, /j-test123/);
+  assert.doesNotMatch(out.content, /state done/);
+});
+
+test("ajq_status returns state only, never the log", async () => {
   const { tools } = await load("warn");
   const status = tools.find((t) => t.name === "ajq_status");
   const out = await status.execute({ id: "j-test123" }, {});
   assert.match(out.content, /state running/);
-  assert.match(out.content, /some log output/);
+  assert.doesNotMatch(out.content, /output-args:/);
+});
+
+test("ajq_output reads the log and clamps a runaway tail", async () => {
+  const { tools } = await load("warn");
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", tail: 99999999999999 }, {});
+  assert.match(out.content, /output-args:/);
+  assert.match(out.content, /--tail 1000\b/);
+});
+
+test("ajq_output says when a job has no output", async () => {
+  const { tools } = await load("warn", { STUB_OUTPUT_EMPTY: "1" });
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-empty" }, {});
+  assert.match(out.content, /has no output/);
+});
+
+test("ajq_output reads a head instead of the tail", async () => {
+  const { tools } = await load("warn");
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", head: 20 }, {});
+  assert.match(out.content, /--head 20\b/);
+  assert.doesNotMatch(out.content, /--tail/);
+});
+
+test("ajq_output reads an offset window", async () => {
+  const { tools } = await load("warn");
+  const output = tools.find((t) => t.name === "ajq_output");
+  const out = await output.execute({ id: "j-test123", offset: 100, tail: 50 }, {});
+  assert.match(out.content, /--tail 50\b/);
+  assert.match(out.content, /--offset 100\b/);
+});
+
+test("ajq_cancel kills a job and waits by default", async () => {
+  const { tools } = await load("warn");
+  const cancel = tools.find((t) => t.name === "ajq_cancel");
+  const out = await cancel.execute({ id: "j-test123" }, {});
+  assert.match(out.content, /cancel-args: j-test123/);
+  assert.doesNotMatch(out.content, /--no-wait/);
+});
+
+test("ajq_cancel wait false returns without waiting", async () => {
+  const { tools } = await load("warn");
+  const cancel = tools.find((t) => t.name === "ajq_cancel");
+  const out = await cancel.execute({ id: "j-test123", wait: false }, {});
+  assert.match(out.content, /--no-wait/);
+});
+
+test("ajq_wait returns the final state and log in one call", async () => {
+  const { tools } = await load("warn");
+  const wait = tools.find((t) => t.name === "ajq_wait");
+  const out = await wait.execute({ id: "j-test123", tail: 2 }, {});
+  assert.match(out.content, /state done/);
+  assert.match(out.content, /log line two/);
 });
 
 test("the queue snapshot is injected once", async () => {

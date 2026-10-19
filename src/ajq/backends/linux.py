@@ -1,8 +1,13 @@
 """Linux backend: every job runs inside its own transient systemd scope unit.
 
     systemd-run --user --scope --quiet --unit=ajq-<id> \
-      -p MemoryMax=<m>M -p MemorySwapMax=0 -p CPUQuota=<cpu>% \
-      [-p Nice=<n>] -p OOMPolicy=stop -- <argv>
+      -p MemoryHigh=<m>M -p MemoryMax=<m*hard_factor>M -p MemorySwapMax=<s>M \
+      -p CPUQuota=<cpu>% [-p Nice=<n>] -p OOMPolicy=stop -- <argv>
+
+That is the soft-cap form, used on cgroup v2 when zram is the first swap (or
+`resources.swap_mb` > 0): above MemoryHigh the kernel throttles the scope and
+reclaims its pages to zram instead of killing it, and MemoryMax is the hard
+ceiling. Everywhere else the cap is `-p MemoryMax=<m>M -p MemorySwapMax=0`.
 
 The unit owns the cgroup, so a SIGTERM to the process group is not enough on its
 own: children that re-forked into other groups are still bounded by the cgroup,
@@ -28,7 +33,8 @@ import subprocess
 import time
 from typing import Any, Optional
 
-from .base import Handle, effective_resources, resolve_resources
+from .. import platform
+from .base import Handle, effective_resources, hard_ceiling_mb, resolve_resources
 from .macos import MacosBackend
 
 UNIT_PREFIX = "ajq-"
@@ -141,6 +147,9 @@ class LinuxBackend:
         self.cpu_percent: int = values["cpu_percent"]
         self.nice: int = values["nice"]
         self.extra_args: list[str] = values["extra_args"]
+        self.hard_factor: float = values["hard_factor"]
+        self.swap_mb: Optional[int] = values["swap_mb"]
+        self.cgroup_v2_memory = platform.cgroup_v2_memory()
         self._live: dict[int, subprocess.Popen] = {}
         self._units: dict[int, str] = {}
         self._fallback: Optional[MacosBackend] = None
@@ -176,6 +185,20 @@ class LinuxBackend:
             "extra_args": self.extra_args,
         })
 
+    def soft_cap(self) -> bool:
+        """True when a job's cap is MemoryHigh with swap, False for the hard MemoryMax cap.
+
+        MemoryHigh only helps when the throttled pages have somewhere cheap to
+        go: on a swapless box it throttles a job until its timeout instead of
+        killing it, and with disk swap first it pages the desktop into a stall.
+        cgroup v1 and hybrid hierarchies ignore MemoryHigh and MemorySwapMax.
+        """
+        if self._fallback is not None or not self.cgroup_v2_memory:
+            return False
+        if self.swap_mb is not None:
+            return self.swap_mb > 0
+        return platform.zram_is_primary_swap()
+
     def rss_mb(self, pid: int) -> int | None:
         if self._fallback is not None:
             return self._fallback.rss_mb(pid)
@@ -191,11 +214,17 @@ class LinuxBackend:
 
     def command(self, job: dict, argv: list[str]) -> list[str]:
         limits = self.resources(job)
-        props = [
-            f"MemoryMax={limits['memory_mb']}M",
-            "MemorySwapMax=0",
-            f"CPUQuota={limits['cpu_percent']}%",
-        ]
+        memory = limits["memory_mb"]
+        if self.soft_cap():
+            swap = self.swap_mb if self.swap_mb is not None else memory
+            props = [
+                f"MemoryHigh={memory}M",
+                f"MemoryMax={hard_ceiling_mb(memory, self.hard_factor)}M",
+                f"MemorySwapMax={swap}M",
+            ]
+        else:
+            props = [f"MemoryMax={memory}M", "MemorySwapMax=0"]
+        props.append(f"CPUQuota={limits['cpu_percent']}%")
         payload = list(argv)
         if self.nice_supported():
             props.append(f"Nice={limits['nice']}")

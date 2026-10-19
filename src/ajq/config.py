@@ -33,10 +33,15 @@ DEFAULTS: dict = {
     },
     "resources": {
         "memory_mb": 2048,
+        "pool_memory_mb": {},
         "cpu_percent": 200,
         "nice": 10,
         "backend": "auto",
         "memory_headroom": 1.2,
+        "swap_credit": 1.0,
+        "hard_factor": 1.5,
+        "swap_mb": None,
+        "admission": {"psi_memory_max": 5, "psi_cpu_max": 70, "temp_max_c": 95},
         "extra_args": [],
     },
     "estimates": {
@@ -77,7 +82,7 @@ ENV_KEYS: tuple[tuple[str, str, str], ...] = (
 _DOC: dict[str, str] = {
     "limits": "max_concurrent caps every pool at once; pools.* caps one tier each.",
     "defaults": "Per-job fallbacks used when the matching submit flag is absent.",
-    "resources": "Enforcement handed to the exec backend; memory_headroom gates admission.",
+    "resources": "Enforcement handed to the exec backend; pool_memory_mb is one tier's soft cap and reservation, hard_factor sets the kill ceiling, swap_credit counts free zram toward admission, admission.* holds new jobs under pressure.",
     "estimates": "Welford duration cache; light_threshold_s promotes cheap jobs to the light pool.",
     "hooks": "guard_mode for PreToolUse guards: warn | block | off.",
     "daemon": "Unit name, serve tick interval, socket override (null = default path).",

@@ -15,6 +15,7 @@ DEFAULT_MEMORY_MB = 2048
 DEFAULT_CPU_PERCENT = 200
 DEFAULT_NICE = 10
 DEFAULT_EXTRA_ARGS: tuple[str, ...] = ()
+DEFAULT_HARD_FACTOR = 1.5
 
 _INT_FIELDS = ("memory_mb", "cpu_percent", "nice")
 
@@ -79,6 +80,8 @@ def _mapping(value: Any) -> dict[str, Any]:
             ("resources.cpu_percent", DEFAULT_CPU_PERCENT),
             ("resources.nice", DEFAULT_NICE),
             ("resources.extra_args", DEFAULT_EXTRA_ARGS),
+            ("resources.hard_factor", DEFAULT_HARD_FACTOR),
+            ("resources.swap_mb", None),
         ):
             try:
                 out[key.rsplit(".", 1)[1]] = get(key, default)
@@ -91,6 +94,13 @@ def _mapping(value: Any) -> dict[str, Any]:
 def _as_int(value: Any, default: int) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -124,7 +134,14 @@ def resolve_resources(args: Sequence[Any] = (), kwargs: dict | None = None) -> d
         "cpu_percent": max(1, _as_int(found.get("cpu_percent"), DEFAULT_CPU_PERCENT)),
         "nice": max(0, _as_int(found.get("nice"), DEFAULT_NICE)),
         "extra_args": [str(part) for part in (extra or ())],
+        "hard_factor": max(1.0, _as_float(found.get("hard_factor"), DEFAULT_HARD_FACTOR)),
+        "swap_mb": None if found.get("swap_mb") is None else max(0, _as_int(found.get("swap_mb"), 0)),
     }
+
+
+def hard_ceiling_mb(memory_mb: int, hard_factor: float) -> int:
+    """Kill ceiling for a job whose soft cap is `memory_mb`."""
+    return max(int(memory_mb), int(memory_mb * max(1.0, hard_factor)))
 
 
 def effective_resources(job: dict, defaults: dict[str, Any]) -> dict[str, Any]:

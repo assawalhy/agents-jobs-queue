@@ -245,12 +245,22 @@ class TestPipedInstall(InstallerCase):
         self.assertEqual(
             sorted(os.listdir(bare)), ["install.sh"], "the bare dir must start empty"
         )
+        # A pull-request checkout is a detached merge commit with no local `main`,
+        # so publish the checked-out commit as `main` in a throwaway remote.
+        remote = tempfile.mkdtemp(prefix="ajq-remote-")
+        self.addCleanup(shutil.rmtree, remote, True)
+        subprocess.run(["git", "init", "--quiet", "--bare", remote], check=True)
+        subprocess.run(
+            ["git", "-C", str(REPO), "push", "--quiet", remote, "HEAD:refs/heads/main"],
+            check=True,
+            capture_output=True,
+        )
         result = self.pipe(
             bare,
             "--no-daemon",
             "--target",
             "claude",
-            env_extra={"AJQ_REPO_URL": f"file://{REPO}", "AJQ_FETCH": "git"},
+            env_extra={"AJQ_REPO_URL": f"file://{remote}", "AJQ_FETCH": "git"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("fetching", result.stdout)

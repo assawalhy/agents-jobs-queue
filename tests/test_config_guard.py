@@ -38,6 +38,12 @@ class TestConfig(helpers.AjqTestCase):
         self.assertEqual(config.get("defaults.timeout_s"), 5)
         self.assertEqual(config.get("limits.max_concurrent"), 8)  # untouched default
 
+    def test_pool_memory_mb_merges_from_user_file(self):
+        path = self.config_file({"resources": {"pool_memory_mb": {"heavy": 6144}}})
+        config = ajq_config.load_config(path=path)
+        self.assertEqual(config.get("resources.pool_memory_mb.heavy"), 6144)
+        self.assertEqual(config.get("resources.memory_mb"), 2048)  # untouched default
+
     def test_flags_beat_file_and_env(self):
         path = self.config_file({"defaults": {"timeout_s": 5}})
         os.environ["AJQ_TIMEOUT_S"] = "99"
@@ -142,10 +148,87 @@ class TestGuard(unittest.TestCase):
         self.assertFalse(guard.is_heavy_command("ls -la"))
         self.assertFalse(guard.is_heavy_command('echo "unbalanced ( quote'))
 
+    def test_read_only_command_chain_is_light(self):
+        """A `&&` chain of read-only git/echo must never be treated as heavy."""
+        command = (
+            "cd /work/tree && git log --oneline -4 && echo '--- status ---' "
+            "&& git status --short && git rev-parse --abbrev-ref HEAD "
+            "&& git rev-list --left-right --count origin/main...HEAD"
+        )
+        self.assertFalse(guard.is_heavy_command(command))
+        verdict = guard.classify(command.split())
+        self.assertEqual(verdict["kind"], "check")
+        self.assertFalse(verdict["heavy"])
+
     def test_explain_mentions_the_recommended_command(self):
         text = guard.explain(["npm", "run", "build"])
         self.assertIn("ajq", text)
         self.assertIn("heavy", text.lower())
+
+    def test_explain_turns_a_cd_prefix_into_cwd(self):
+        """Agents must be told about --cwd, not left writing `cd X && ...`."""
+        text = guard.explain(["cd", "/work/apps/web", "&&", "npm", "run", "build"])
+        self.assertIn("ajq submit --cwd /work/apps/web -- npm run build", text)
+
+    def test_explain_teaches_cwd_for_a_shell_wrapper(self):
+        text = guard.explain(
+            ["/bin/sh", "-c", "cd /work/apps/web && bunx vitest run tests/x.test.tsx"]
+        )
+        self.assertIn(
+            "ajq submit --cwd /work/apps/web --shell -- bunx vitest run tests/x.test.tsx", text
+        )
+
+    def test_a_plain_command_stays_plain(self):
+        text = guard.explain(["npm", "run", "build"])
+        self.assertIn("ajq submit -- npm run build", text)
+        self.assertNotIn("--shell", text)
+        self.assertNotIn("--cwd", text)
+
+    def test_a_command_needing_a_shell_keeps_its_metacharacters(self):
+        text = guard.explain(["cargo", "test", "&&", "echo", "done"])
+        self.assertIn("ajq submit --shell -- cargo test && echo done", text)
+
+    def test_a_shell_suggestion_restores_the_quoting(self):
+        text = guard.explain(
+            ["pytest", "-q", "-k", "leads and sales", "|", "tee", "/tmp/out.log"]
+        )
+        self.assertIn("ajq submit --shell -- pytest -q -k 'leads and sales' | tee /tmp/out.log", text)
+
+    def test_a_shell_job_without_a_prefix_never_gets_cwd(self):
+        text = guard.explain(["sh", "-c", "for i in 1 2 3; do cargo test; done"])
+        self.assertNotIn("--cwd", text)
+        self.assertIn("--shell -- for i in 1 2 3; do cargo test; done", text)
+
+    def test_a_cd_chain_joins_relative_directories(self):
+        text = guard.explain(["cd", "apps", "&&", "cd", "web", "&&", "npm", "run", "build"])
+        self.assertIn("ajq submit --cwd apps/web -- npm run build", text)
+
+    def test_a_cd_into_a_variable_stays_in_the_script(self):
+        self.assertTrue(guard.needs_script('cd "$DIR" && npm run build'))
+        text = guard.explain(["sh", "-c", 'cd "$DIR" && npm run build'])
+        self.assertIn('ajq submit --shell -- cd "$DIR" && npm run build', text)
+        self.assertNotIn("--cwd", text)
+
+    def test_a_multi_line_script_is_one_quoted_argument(self):
+        self.assertTrue(guard.needs_script("npm run build\necho done"))
+        text = guard.explain(["sh", "-c", "npm run build\necho done"])
+        self.assertIn("ajq submit --shell -- 'npm run build\necho done'", text)
+
+    def test_submit_line_quotes_a_directory_with_a_space(self):
+        line = guard.submit_line(["cd", "/work/with space/app", "&&", "npm", "run", "build"])
+        self.assertEqual(line, "ajq submit --cwd '/work/with space/app' -- npm run build")
+
+    def test_submit_line_carries_the_pool(self):
+        line = guard.submit_line(["make", "bootstrap"], pool="normal")
+        self.assertEqual(line, "ajq submit --pool normal -- make bootstrap")
+
+    def test_split_cd_prefix_stops_at_the_first_non_cd_word(self):
+        directory, rest = guard.split_cd_prefix("cd /a && cd /b && make test")
+        self.assertEqual((directory, rest), ("/b", "make test"))
+
+    def test_split_cd_prefix_leaves_other_commands_alone(self):
+        directory, rest = guard.split_cd_prefix("bunx vitest run tests/x")
+        self.assertEqual((directory, rest), ("", "bunx vitest run tests/x"))
 
     def test_tool_names_are_unwrapped(self):
         """Launchers must not become the cache key, or the same tool never hits."""

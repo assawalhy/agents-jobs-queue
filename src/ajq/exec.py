@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from . import paths
+from .backends.base import hard_ceiling_mb
 
 TRUNCATION_MARKER = b"\n[ajq] output limit reached; output truncated\n"
 DEFAULT_KILL_GRACE_S = 10.0
@@ -122,14 +123,19 @@ class JobRunner:
 
     # -- limits ----------------------------------------------------------
     def memory_limit_mb_for(self, job: dict) -> Optional[int]:
-        """job override, then the runner default, then the backend default."""
+        """Kill ceiling: the cap (job override, runner default, backend default),
+        times hard_factor only when the backend enforces the cap as MemoryHigh."""
+        soft_cap = getattr(self.backend, "soft_cap", None)
+        factor = getattr(self.backend, "hard_factor", 1.0) if callable(soft_cap) and soft_cap() else 1.0
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            factor = 1.0
         for value in (job.get("memory_mb"), self.memory_limit_mb,
                       getattr(self.backend, "memory_mb", None)):
             if value is None:
                 continue
             limit = int(value)
             if limit > 0:
-                return limit
+                return hard_ceiling_mb(limit, float(factor))
         return None
 
     # -- execution -------------------------------------------------------

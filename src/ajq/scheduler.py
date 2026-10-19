@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
+import math
 import time
 from typing import Any, Optional, Sequence
 
@@ -99,6 +101,8 @@ class Scheduler:
         self._running: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, tuple[str, str, str]] = {}
         self._lock = threading.RLock()
+        self._temp_ema: Optional[float] = None
+        self._temp_at = 0.0
 
     # ------------------------------------------------------------------ submit
     def submit(
@@ -144,6 +148,7 @@ class Scheduler:
         if pool in (None, "", "auto"):
             pool = self._auto_pool(verdict["pool"], kind, est_seconds)
         pool = str(pool)
+        memory_mb = self._memory_for({"memory_mb": memory_mb, "pool": pool})
 
         job = self._add_job(
             self._fields(
@@ -189,6 +194,18 @@ class Scheduler:
         except sqlite3.Error:  # store without the optional per-job override columns
             return self.store.add_job(**{k: v for k, v in fields.items() if k not in _OPTIONAL_FIELDS})
 
+    def _memory_for(self, job: dict) -> int:
+        """A job's memory cap: explicit value, else its pool's, else the global default."""
+        explicit = _as_int(job.get("memory_mb"), 0)
+        if explicit > 0:
+            return explicit
+        tier = str(job.get("pool") or "normal")
+        pools = self.config.get("resources.pool_memory_mb", {}) or {}
+        value = pools.get(tier) if isinstance(pools, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+        return max(1, _as_int(self.config.get("resources.memory_mb", 2048), 2048))
+
     def _auto_pool(self, base_pool: str, kind: str, est_seconds: float) -> str:
         """Guard pool, plus the cheap-unknown promotion the plan asks for."""
         if kind in guard.HEAVY_KINDS:
@@ -199,11 +216,51 @@ class Scheduler:
         return base_pool
 
     # -------------------------------------------------------------------- tick
-    def tick(self) -> list[str]:
-        """Start every job that fits the caps right now; never blocks."""
-        started: list[str] = []
-        total_limit = _as_int(self.config.get("limits.max_concurrent", 8), 8)
-        pools = self.config.get("limits.pools", {}) or {}
+    def _cpu_temp(self) -> Optional[float]:
+        """CPU temperature averaged over ~30 s, so one spike does not hold the queue."""
+        reading = platform.cpu_temp_c()
+        with self._lock:
+            if reading is None:
+                self._temp_ema = None
+                return None
+            now = time.monotonic()
+            if self._temp_ema is None or now - self._temp_at > 120:
+                self._temp_ema = reading
+            else:
+                alpha = 1.0 - math.exp(-(now - self._temp_at) / 30.0)
+                self._temp_ema += alpha * (reading - self._temp_ema)
+            self._temp_at = now
+            return self._temp_ema
+
+    def pressure(self) -> tuple[str, str]:
+        """(memory_reason, cpu_reason) to hold new admissions; "" when clear."""
+        gates = self.config.get("resources.admission", {}) or {}
+        if not isinstance(gates, dict):
+            gates = {}
+        memory = cpu = ""
+        limit = _as_float(gates.get("psi_memory_max"), 0.0)
+        value = platform.psi_avg10("memory", "full")
+        if limit > 0 and value is not None and value > limit:
+            memory = f"psi-mem {value:.0f}%>{limit:.0f}%"
+        limit = _as_float(gates.get("psi_cpu_max"), 0.0)
+        value = platform.psi_avg10("cpu", "some")
+        if limit > 0 and value is not None and value > limit:
+            cpu = f"psi-cpu {value:.0f}%>{limit:.0f}%"
+        limit = _as_float(gates.get("temp_max_c"), 0.0)
+        temp = self._cpu_temp() if limit > 0 else None
+        if not cpu and temp is not None and temp > limit:
+            cpu = f"temp {temp:.0f}C>{limit:.0f}C"
+        return memory, cpu
+
+    def memory_budget_mb(self) -> int:
+        """MemAvailable plus the RAM that swapping to zram can still free."""
+        free = _as_int(platform.available_memory_mb(), 0)
+        credit = _as_float(self.config.get("resources.swap_credit", 1.0), 0.0)
+        if credit > 0:
+            free += int(_as_int(platform.zram_credit_mb(), 0) * credit)
+        return free
+
+    def admission_state(self) -> dict:
         running = self.store.running_jobs()
         counts: dict[str, int] = {}
         busy: set[str] = set()
@@ -213,29 +270,64 @@ class Scheduler:
             key = str(job.get("serial_key") or "")
             if key:
                 busy.add(key)
-        free = _as_int(platform.available_memory_mb(), 0)
-        headroom = _as_float(self.config.get("resources.memory_headroom", 1.2), 1.0)
-        for job in self.store.queued_jobs():
-            if len(running) + len(started) >= total_limit:
-                break
-            tier = str(job.get("pool") or "normal")
-            cap = pools.get(tier)
-            cap = _as_int(cap, total_limit) if isinstance(cap, (int, float)) else total_limit
-            if counts.get(tier, 0) >= cap:
-                continue
-            key = str(job.get("serial_key") or "")
-            if key and key in busy:
-                continue
-            memory = _as_int(job.get("memory_mb")) or _as_int(self.config.get("resources.memory_mb", 2048))
-            if free < int(memory * headroom):
+        memory_hold, cpu_hold = self.pressure()
+        return {
+            "running": len(running),
+            "counts": counts,
+            "busy": busy,
+            "free": self.memory_budget_mb(),
+            "memory_hold": memory_hold,
+            "cpu_hold": cpu_hold,
+        }
+
+    def _hold(self, job: dict, state: dict) -> str:
+        """Why `job` cannot start against `state` right now; "" when it can."""
+        total_limit = _as_int(self.config.get("limits.max_concurrent", 8), 8)
+        if state["running"] >= total_limit:
+            return f"max_concurrent {state['running']}/{total_limit}"
+        pools = self.config.get("limits.pools", {}) or {}
+        tier = str(job.get("pool") or "normal")
+        cap = pools.get(tier) if isinstance(pools, dict) else None
+        cap = _as_int(cap, total_limit) if isinstance(cap, (int, float)) else total_limit
+        if state["counts"].get(tier, 0) >= cap:
+            return f"pool {tier} {state['counts'].get(tier, 0)}/{cap}"
+        key = str(job.get("serial_key") or "")
+        if key and key in state["busy"]:
+            return "serial_key busy"
+        # Progress rule: with nothing running, no reservation or pressure reading may
+        # keep the head job queued, or memory held by other programs (or stall from
+        # a job that already ended) blocks the queue indefinitely.
+        if state["running"] == 0:
+            return ""
+        if state["memory_hold"]:
+            return state["memory_hold"]
+        if state["cpu_hold"]:
+            return state["cpu_hold"]
+        need = int(self._memory_for(job) * _as_float(self.config.get("resources.memory_headroom", 1.2), 1.0))
+        if state["free"] < need:
+            return f"memory {need}>{max(0, state['free'])}MB"
+        return ""
+
+    def tick(self) -> list[str]:
+        """Start every job that fits the caps right now; never blocks."""
+        started: list[str] = []
+        queued = self.store.queued_jobs()
+        if not queued:
+            return started
+        state = self.admission_state()
+        for job in queued:
+            if self._hold(job, state):
                 continue
             if not self._start(job):
                 continue
             started.append(str(job["id"]))
-            counts[tier] = counts.get(tier, 0) + 1
+            tier = str(job.get("pool") or "normal")
+            state["running"] += 1
+            state["counts"][tier] = state["counts"].get(tier, 0) + 1
+            key = str(job.get("serial_key") or "")
             if key:
-                busy.add(key)
-            free -= max(0, memory)
+                state["busy"].add(key)
+            state["free"] -= max(0, self._memory_for(job))
         return started
 
     def _start(self, job: dict) -> bool:
@@ -244,12 +336,18 @@ class Scheduler:
         with self._lock:
             if job_id in self._running:
                 return False
-        try:
-            started = self.store.start(
-                job_id, 0, str(getattr(self.backend, "name", "") or "")
-            )  # pid filled in by _record_pid once the child exists
-        except (KeyError, sqlite3.Error):
-            return False
+            # The connection threads and the tick loop both reach _start, so the
+            # queued check and the transition to running must be one critical
+            # section, or a forced start and a tick can spawn the same job twice.
+            fresh = self.store.get(job_id)
+            if fresh is None or str(fresh.get("state") or "") != "queued":
+                return False
+            try:
+                started = self.store.start(
+                    job_id, 0, str(getattr(self.backend, "name", "") or "")
+                )  # pid filled in by _record_pid once the child exists
+            except (KeyError, sqlite3.Error):
+                return False
         if not started:
             return False
         row = dict(started)
@@ -323,6 +421,84 @@ class Scheduler:
 
         return add
 
+    # --------------------------------------------------------------- forced start
+    def start_all_plan(self, ignore_serial: bool = False) -> dict:
+        """The queue as a forced start sees it: jobs, blocked count, resource totals.
+
+        Caps do not apply here. The serial key still does unless `ignore_serial`,
+        because two jobs that share a checkout write the same build directories.
+        """
+        queued = self.store.queued_jobs()
+        busy = self._busy_serials()
+        startable: list[dict] = []
+        blocked = 0
+        for job in queued:
+            key = str(job.get("serial_key") or "")
+            if key and not ignore_serial and key in busy:
+                blocked += 1
+                continue
+            startable.append(job)
+            if key:
+                busy.add(key)
+        return self._plan_of(startable, blocked, len(queued), ignore_serial)
+
+    def _busy_serials(self) -> set[str]:
+        return {
+            str(job.get("serial_key"))
+            for job in self.store.running_jobs()
+            if job.get("serial_key")
+        }
+
+    def _plan_of(
+        self, jobs: Sequence[dict], blocked: int, total: int, ignore_serial: bool
+    ) -> dict:
+        default_cpu = max(1, _as_int(self.config.get("resources.cpu_percent", 200), 200))
+        memory = 0
+        cpu = 0
+        pools: dict[str, int] = {}
+        rows: list[dict] = []
+        admission = self.admission_state() if jobs else None
+        for job in jobs:
+            reserved = self._memory_for(job)
+            percent = _as_int(job.get("cpu_percent"), default_cpu) or default_cpu
+            tier = str(job.get("pool") or "normal")
+            pools[tier] = pools.get(tier, 0) + 1
+            memory += reserved
+            cpu += percent
+            row = dict(job)
+            row["memory_mb"] = reserved
+            row["cpu_percent"] = percent
+            rows.append(self.enrich(row, admission))
+        caps = self.config.get("limits.pools", {}) or {}
+        return {
+            "total": total,
+            "startable": len(rows),
+            "blocked_by_serial": blocked,
+            "ignore_serial": bool(ignore_serial),
+            "memory_mb": memory,
+            "cpu_percent": cpu,
+            "available_memory_mb": max(0, _as_int(platform.available_memory_mb(), 0)),
+            "total_memory_mb": max(0, _as_int(platform.total_memory_mb(), 0)),
+            "cpu_count": max(0, _as_int(platform.cpu_count(), 0)),
+            "max_concurrent": max(1, _as_int(self.config.get("limits.max_concurrent", 8), 8)),
+            "memory_headroom": _as_float(self.config.get("resources.memory_headroom", 1.2), 1.0),
+            "pool_counts": pools,
+            "pool_caps": {key: _as_int(value) for key, value in caps.items()}
+            if isinstance(caps, dict)
+            else {},
+            "jobs": rows,
+        }
+
+    def start_all(self, ignore_serial: bool = False) -> dict:
+        """Start every job the plan lists; a job that is no longer queued is skipped."""
+        plan = self.start_all_plan(ignore_serial)
+        started: list[str] = []
+        for job in plan["jobs"]:
+            if self._start(job):
+                started.append(str(job["id"]))
+        jobs = [self.enrich(self.store.get(job_id) or {}) for job_id in started]
+        return {"plan": plan, "started": started, "jobs": jobs}
+
     # -------------------------------------------------------------- completion
     def on_finished(self, job: dict, result: RunResult) -> dict:
         """Persist the terminal state, feed the estimate, refresh meta.json."""
@@ -369,17 +545,57 @@ class Scheduler:
                 entry = self._running.get(job_id)
             if entry is not None:
                 entry["cancel"].set()
+            else:
+                # No local runner owns this job: a stale daemon (or one from
+                # before the singleton lock) started it. Kill the process group
+                # recorded in the shared DB so the job still dies; its owner
+                # records the terminal state when the child exits.
+                self._kill_recorded(job)
         return self.enrich(self.store.get(job_id) or job)
 
-    # ------------------------------------------------------------- enrichment
-    def enrich(self, job: dict) -> dict:
-        """Add the derived metadata keys; safe on any job dict, never raises."""
+    def _kill_recorded(self, job: dict) -> None:
+        """SIGTERM then SIGKILL the process group a job recorded in the DB."""
+        pid = _as_int(job.get("pid"))
+        if pid <= 1:
+            return
         try:
-            return self._enrich(dict(job))
+            group = os.getpgid(pid)
+        except OSError:
+            return
+        if group <= 1 or group == os.getpgid(0):
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(group, sig)
+            except OSError:
+                return
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(group, 0)
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+    # ------------------------------------------------------------- enrichment
+    def enrich(self, job: dict, admission: Optional[dict] = None) -> dict:
+        """Add the derived metadata keys; safe on any job dict, never raises.
+
+        Pass one `admission_state()` when enriching a list, so the /proc and
+        /sys probes run once per request instead of once per job.
+        """
+        try:
+            return self._enrich(dict(job), admission)
         except Exception:
             return dict(job)
 
-    def _enrich(self, job: dict) -> dict:
+    def enrich_many(self, jobs: Sequence[dict]) -> list[dict]:
+        admission = self.admission_state() if any(
+            str(job.get("state") or "") == "queued" for job in jobs
+        ) else None
+        return [self.enrich(job, admission) for job in jobs]
+
+    def _enrich(self, job: dict, admission: Optional[dict] = None) -> dict:
         now = time.time()
         anchor = _as_float(job.get("started_at"), 0.0) or _as_float(job.get("enqueued_at"), now)
         ended = _as_float(job.get("ended_at"), 0.0)
@@ -395,6 +611,11 @@ class Scheduler:
         job["eta_start_s"] = self._eta_start(job, position) if position else 0.0
         job["eta_run_s"] = job["est_seconds"]
         job["eta_total_s"] = round(job["eta_start_s"] + job["eta_run_s"], 1)
+        if position:
+            state = admission if admission is not None else self.admission_state()
+            job["blocked"] = self._hold(job, {**state, "busy": set(state["busy"]), "counts": dict(state["counts"])})
+        else:
+            job["blocked"] = ""
         return job
 
     def _eta_start(self, job: dict, position: int) -> float:

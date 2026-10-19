@@ -170,6 +170,115 @@ def _tool_for(argv: Sequence[str]) -> str:
     return head[:_MAX_TOOL]
 
 
+SHELL_NAMES: frozenset[str] = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
+
+# `cd <dir> && ` at the start of a shell script, quoted or bare.
+_CD_PREFIX = re.compile(r"""^\s*cd\s+(?P<dir>'[^']*'|"[^"]*"|\S+)\s*&&\s*""")
+
+# A directory a shell must expand before it names a path.
+_EXPANDS = re.compile(r"[$`]")
+
+# Anything that only a shell can run: these need `ajq submit --shell`.
+_SHELLISH = re.compile(r"[|&;<>()`$*?]")
+
+
+def needs_script(command: str) -> bool:
+    """True when `command` must be classified as `sh -c <command>` rather than split.
+
+    shlex.split joins lines into one argv and strips the quotes around a
+    `cd "$DIR"` target, so both would produce a suggestion that runs something else.
+    """
+    return "\n" in command or bool(_EXPANDS.search(split_cd_prefix(command)[0]))
+
+
+def shell_script(argv: Sequence[str]) -> str | None:
+    """The script of a `sh -c <script>` argv, or None for a plain command."""
+    args = [str(item) for item in (argv or [])]
+    if len(args) == 3 and args[1] == "-c" and os.path.basename(args[0].strip()) in SHELL_NAMES:
+        return args[2]
+    return None
+
+
+def split_cd_prefix(command: str, limit: int = 4) -> tuple[str, str]:
+    """Split a leading `cd <dir> &&` chain off a shell command string.
+
+    Returns the last directory the chain enters and the rest of the command.
+    Agents and harnesses submit `sh -c 'cd <worktree> && <command>'`, and the
+    daemon already runs a job in its own cwd, so the prefix carries no
+    information worth displaying. Everything after it is left verbatim.
+    """
+    directory = ""
+    rest = str(command or "")
+    for _ in range(max(0, limit)):
+        match = _CD_PREFIX.match(rest)
+        if match is None:
+            break
+        raw = match.group("dir")
+        if len(raw) > 1 and raw[0] in "'\"" and raw[-1] == raw[0]:
+            raw = raw[1:-1]
+        directory = os.path.join(directory, raw) if directory else raw
+        rest = rest[match.end() :]
+    return directory, rest
+
+
+def strip_cd_args(argv: Sequence[str]) -> tuple[str, list[str]]:
+    """`["cd", dir, "&&", ...rest]` -> `(dir, rest)`; no chain, no shell needed."""
+    items = [str(item) for item in (argv or [])]
+    directory = ""
+    while len(items) >= 4 and items[0] == "cd" and items[2] == "&&":
+        directory = os.path.join(directory, items[1]) if directory else items[1]
+        items = items[3:]
+    return directory, items
+
+
+# Shell operator words that must stay bare when a command line is rebuilt.
+_OPERATORS = frozenset(
+    {"|", "||", "&&", ";", "&", ">", ">>", "<", "<<", "|&", "2>", "2>>", "2>&1", "&>", "&>>"}
+)
+
+
+def _shell_line(words: Sequence[str]) -> str:
+    """Render an argv as a shell command line: operators bare, every word quoted."""
+    return " ".join(word if word in _OPERATORS else shlex.quote(word) for word in words)
+
+
+def submit_line(argv: Sequence[str], pool: str | None = None) -> str:
+    """The `ajq submit` line that runs this command, with a cd prefix turned into --cwd.
+
+    A `cd <dir> && <command>` prefix becomes `--cwd <dir>`: the daemon runs the
+    job in one directory, so a shell dance around it buys nothing and hides the
+    command. `--shell` is added when the command needs a shell (pipes, `&&`,
+    redirects, globs), because the agent's own shell would otherwise split it.
+    """
+    items = [str(item) for item in (argv or [])]
+    script = shell_script(items)
+    if script is not None:
+        directory, body = split_cd_prefix(script)
+        needs_shell = True
+        if _EXPANDS.search(directory):
+            # `--cwd` is not expanded by a shell, so `cd "$DIR" &&` stays in the script
+            directory, body = "", script
+    else:
+        directory, rest = strip_cd_args(items)
+        words = rest if directory else items
+        plain = shlex.join(words)
+        needs_shell = bool(_SHELLISH.search(plain))
+        # with --shell the argument is a command line, not an argv, so the words
+        # are quoted for a shell instead of for the daemon's argv parser
+        body = _shell_line(words) if needs_shell else plain
+    parts = ["ajq", "submit"]
+    if pool:
+        parts += ["--pool", pool]
+    if directory:
+        parts += ["--cwd", directory]
+    if needs_shell:
+        parts += ["--shell"]
+    if "\n" in body:
+        # a multi-line script must stay one argument, or the lines run as separate commands
+        body = shlex.quote(body)
+    return f"{shlex.join(parts)} -- {body}"
+
+
 def classify(argv: Sequence[str]) -> dict:
     """Verdict for one command. Never raises, whatever `argv` holds."""
     try:
@@ -208,13 +317,13 @@ def explain(argv: Sequence[str]) -> str:
     command = " ".join(args)
     if verdict["heavy"]:
         headline = "HEAVY - worth queueing with ajq"
-        suggestion = f"ajq submit -- {command}"
+        suggestion = submit_line(args)
     elif verdict["kind"] in LIGHT_KINDS:
         headline = "LIGHT - cheap, run it directly"
         suggestion = command
     else:
         headline = "UNKNOWN - ajq cannot place it in a pool"
-        suggestion = f"ajq submit --pool normal -- {command}"
+        suggestion = submit_line(args, pool="normal")
     return "\n".join(
         [
             f"command: {command}",

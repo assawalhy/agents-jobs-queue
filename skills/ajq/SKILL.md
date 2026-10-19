@@ -19,10 +19,20 @@ ajq submit --label api-tests -- pytest tests/api -q
 ajq submit --cwd ../other-worktree -- cargo build
 ```
 
+Give the directory with `--cwd`, never as a `cd <dir> &&` prefix. The daemon
+already runs the job in its own cwd, and a prefix hides the command in
+`ajq list`, so the whole row reads `cd /home/...` instead of the command you
+meant. Reach for `--shell` only when the command really needs a shell: pipes,
+`&&`, redirects, globs, env prefixes.
+
 Keep running these directly — they are milliseconds and the queue adds nothing:
 
-`git status` / `diff` / `log`, `rg`, `grep`, `ls`, `cat`, `head`, `tail`, `jq`,
-`wc`, `find`, `echo`, `pwd`, `which`.
+`git status` / `diff` / `log` / `show` / `branch` / `rev-parse` / `rev-list`,
+`rg`, `grep`, `ls`, `cat`, `head`, `tail`, `jq`, `wc`, `find`, `echo`, `pwd`,
+`which` — and any `&&` chain built only from these.
+
+Never wrap a read-only command in `ajq submit`: the guard classifies it as
+`check` (light) and the queue adds nothing.
 
 Not sure how a command is classified?
 
@@ -41,21 +51,29 @@ ajq guard --explain "npm run build"
 | `--priority N` | higher runs first inside a pool. Use it to unblock a job the user is waiting on. |
 | `--serial-key auto\|none\|NAME` | `auto` (default) serializes by git worktree so two agents in one worktree never overlap. `none` opts out; a name groups unrelated dirs. |
 | `--shell` | run through `$SHELL`; needed for pipes, `&&`, globs, and env prefixes. |
-| `--wait` | block until the job is terminal, then print it. Convenient for a quick job; prefer submit-then-poll for anything slow. |
-| `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. |
-| `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. |
+| `--wait` | block until the job is terminal, then print it. Convenient for a quick job; for anything slow, submit then background `ajq wait <id> --tail N`. |
+| `--memory-mb N`, `--cpu-percent N` | per-job overrides of the global caps. A full `typecheck + coverage` run outgrows the default 2 GB — give it `--memory-mb 12288`, or raise `resources.memory_mb` and restart the daemon. |
+| `--cwd DIR`, `--label NAME`, `--agent NAME` | where to run it, and how it shows up in `ajq list`. Prefer `--cwd` over a `cd <dir> &&` prefix. |
 
 ## Reading a job
 
 ```sh
 ajq status <id>             # state, pool, timing, output path
 ajq status <id> --fields state,elapsed_s,out_bytes   # only what you need
-ajq list                    # queued + running
+ajq list                    # queued + running, each row ends with its command
+ajq list --cmd-width 80     # wider command column (0 prints the whole command)
 ajq list --fields id,state,eta_start_s --all        # compact table of everything
-ajq output <id> --tail 80  # captured output
-ajq wait <id>              # block until terminal
-ajq cancel <id>
+ajq list --select cmd --all                        # just the commands, untrimmed
+ajq output <id> --tail 80  # captured output (the tail)
+ajq output <id> --head 50  # the first lines instead
+ajq output <id> --offset 200 --tail 80   # an interior window
+ajq wait <id> --tail 80    # block until terminal, then state + the log tail
+ajq cancel <id>            # kill it (alias `ajq kill <id>`); waits for the final state
 ```
+
+`ajq list` ends every row with the start of the job's command, trimmed to 48
+characters with `...` (`--cmd-width N`, `0` for all of it), so a row identifies
+itself without `ajq status <id> --verbose`.
 
 Useful keys: `state`, `queue_position`, `elapsed_s`, `eta_start_s`, `eta_run_s`,
 `eta_total_s`, `est_source`, `out_path`, `out_bytes`, `truncated`, `exit_code`,
@@ -86,19 +104,59 @@ thrashing.
 
 Dev servers and watch processes: `ajq submit --pool service -- npm run dev`.
 
+`ajq start` (alias `ajq start-all`) is a human escape hatch, not an agent tool:
+it starts the entire queued backlog at once, over the pool caps, `max_concurrent`
+and the memory admission gate, after printing the reserved memory and CPU and
+asking for confirmation. It keeps the worktree serial key unless `--ignore-serial`,
+`--dry-run` prints the plan only, and `--json` starts nothing unless `--yes` is
+also given. Never call it to unblock your own job: raise `--priority`, or let the
+queue move, and do not burst the machine someone else is using.
+
 ## Waiting and streaming
 
-**Never `sleep` to wait for a job.** `ajq wait <id>` blocks until the job is
-terminal and returns exit 0 only for `done`, so one command replaces the
-sleep-poll-retry loop.
+**Never `sleep`, and never poll `ajq status` in a loop.** One call gets the result:
 
 ```sh
-ajq wait <id>                    # block, then print the final state
+ajq wait <id> --tail 80          # final state + the last 80 log lines, one call
 ajq wait <id> --timeout 300      # give up after 5 minutes
 ```
 
+`ajq wait` blocks until the job is terminal, prints the final state, then the
+`--tail` lines, and exits 0 only for `done` (2 otherwise). That replaces the
+`wait` + `output` pair and the `| grep` half of a poll.
+
+The old reflex — `sleep 115` — exists only because a *shell* call is SIGTERMed at
+~120 s. Two ways around it, both without polling:
+
+- **Background the wait** (preferred for a slow job). Launch `ajq wait <id> --tail 80`
+  as a background task: it returns immediately, the session stays interactive, and
+  you are resumed with the output when the job ends. OpenCode: the shell tool's
+  background mode. Claude Code: `run_in_background`.
+- **OpenCode's `ajq_wait` tool**: the same wait in-process (state + tail, not the
+  shell's 120 s timeout). Good for a job that finishes within a turn; for a long
+  one, background `ajq wait` instead.
+- **OpenCode's `ajq_submit` tool already does this for cheap jobs.** It waits up to
+  `wait_s` (default 20, max 120) when the daemon's own estimate says the job will be
+  over inside that budget, and returns the state and log in the same call — no
+  `ajq_wait` follow-up. A job estimated longer, or one sitting behind others in the
+  queue (`eta_start_s`), comes back as an id to follow with `ajq_wait`. Pass
+  `wait_s: 0` to always get the id immediately.
+
+In OpenCode, `ajq_status` returns **state only** — no log. That is deliberate, so a
+running job cannot be polled for output. Read the log with `ajq_output` (the tail,
+or `head`/`offset` for any window), or get state + log together with `ajq_wait`.
+`ajq_cancel` kills a job and returns its final state in one call.
+
 To watch a job while it runs: `ajq output <id> --follow` (streams until the job
 is terminal). `--from-start` replays the whole log instead of the last 40 lines.
+`--head N` reads the first N lines and `--offset N` skips N lines before the
+tail/head, so `--offset 200 --tail 80` is an interior window — read the top of a
+long log without dumping all of it.
+
+`ajq cancel <id>` (alias `ajq kill <id>`) stops a queued or running job and then
+**waits** (bounded by its `kill_grace_s`) for it to actually die, printing the
+final state — so one call confirms the kill. `--no-wait` returns as soon as the
+job is signalled. A running job is SIGTERMed, then SIGKILLed after the grace.
 
 ## Cheap polling
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from unittest import mock
 
 import helpers
 
-from ajq import paths
+from ajq import paths, platform
 from ajq.backends.macos import MacosBackend
 from ajq.exec import JobRunner
 from ajq.scheduler import Scheduler
@@ -17,9 +18,17 @@ PY = "python3"
 SHORT = [PY, "-c", "import time; time.sleep(3)"]
 
 
+_CALM = {
+    "swap_credit": 0,
+    "admission": {"psi_memory_max": 0, "psi_cpu_max": 0, "temp_max_c": 0},
+}
+
+
 def make_scheduler(self, **overrides):
     store = helpers.store()
     self.addCleanup(store.close)
+    # Pressure gates and zram credit read the host; tests opt in to them explicitly.
+    overrides["resources"] = {**_CALM, **overrides.get("resources", {})}
     config = helpers.load_config(**overrides)
     backend = MacosBackend()
     runner = JobRunner(backend, poll_interval=0.05)
@@ -30,6 +39,16 @@ def wait_for_state(scheduler, job_id, states, timeout=15.0):
     return helpers.wait_until(
         lambda: (scheduler.store.get(job_id) or {}).get("state") in states, timeout=timeout
     )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class TestSubmit(helpers.AjqTestCase):
@@ -127,9 +146,113 @@ class TestScheduling(helpers.AjqTestCase):
             limits={"max_concurrent": 8, "pools": {"heavy": 8}},
             resources={"memory_mb": 8 * 1024 * 1024, "memory_headroom": 1.2},
         )
-        scheduler.submit(argv=SHORT, cwd=self.state_dir, serial_key="w0")
+        scheduler.submit(argv=SHORT, cwd=self.state_dir, serial_key="w0", memory_mb=1)
+        self.assertEqual(len(scheduler.tick()), 1)
+        big = scheduler.submit(argv=SHORT, cwd=self.state_dir, serial_key="w1")
         self.assertEqual(scheduler.tick(), [])
-        self.assertEqual(store.count_by_state().get("queued"), 1)
+        self.assertEqual(store.get(big["id"])["state"], "queued")
+        self.assertTrue(scheduler.enrich(store.get(big["id"]))["blocked"].startswith("memory "))
+
+    def test_pool_memory_is_resolved_on_submit(self):
+        scheduler, _ = make_scheduler(
+            self,
+            resources={"memory_mb": 2048, "pool_memory_mb": {"heavy": 6144, "light": 1024}},
+        )
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy")
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light")
+        other = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="service")
+        explicit = scheduler.submit(
+            argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", memory_mb=4096
+        )
+        self.assertEqual(heavy["memory_mb"], 6144)
+        self.assertEqual(light["memory_mb"], 1024)
+        self.assertEqual(other["memory_mb"], 2048)
+        self.assertEqual(explicit["memory_mb"], 4096)
+
+    def test_pool_memory_blocks_heavy_but_admits_light(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}},
+            resources={
+                "memory_mb": 2048,
+                "memory_headroom": 1.2,
+                "pool_memory_mb": {"heavy": 8 * 1024 * 1024, "light": 1},
+            },
+        )
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="w1")
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="w0")
+        started = scheduler.tick()
+        self.assertEqual(started, [light["id"]])
+        self.assertEqual(store.get(heavy["id"])["state"], "queued")
+        self.assertEqual(store.get(light["id"])["state"], "running")
+
+    def test_progress_rule_starts_head_job_when_reservation_exceeds_budget(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"heavy": 2}},
+            resources={"pool_memory_mb": {"heavy": 8 * 1024 * 1024}},
+        )
+        first = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="w0")
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="w1")
+        self.assertEqual(scheduler.tick(), [first["id"]])
+        self.assertEqual(store.get(second["id"])["state"], "queued")
+
+    def test_pressure_never_holds_the_head_job_when_nothing_runs(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"normal": 8}},
+            resources={"admission": {"psi_memory_max": 5, "psi_cpu_max": 0, "temp_max_c": 0}},
+        )
+        first = scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w0")
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w1")
+        with mock.patch.object(platform, "psi_avg10", return_value=25.0):
+            self.assertEqual(scheduler.tick(), [first["id"]])
+            self.assertEqual(scheduler.enrich(store.get(second["id"]))["blocked"], "psi-mem 25%>5%")
+        self.assertEqual(scheduler.tick(), [second["id"]])
+
+    def test_cpu_pressure_and_temperature_hold_only_a_second_job(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"normal": 8}},
+            resources={"admission": {"psi_memory_max": 0, "psi_cpu_max": 70, "temp_max_c": 90}},
+        )
+        first = scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w0")
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w1")
+        with mock.patch.object(platform, "psi_avg10", return_value=0.0), \
+                mock.patch.object(platform, "cpu_temp_c", return_value=97.0):
+            scheduler._temp_ema = None
+            self.assertEqual(scheduler.tick(), [first["id"]])
+            self.assertEqual(scheduler.enrich(store.get(second["id"]))["blocked"], "temp 97C>90C")
+        with mock.patch.object(platform, "psi_avg10", return_value=85.0), \
+                mock.patch.object(platform, "cpu_temp_c", return_value=None):
+            self.assertEqual(scheduler.tick(), [])
+            self.assertEqual(scheduler.enrich(store.get(second["id"]))["blocked"], "psi-cpu 85%>70%")
+            self.assertIsNone(scheduler._temp_ema)
+
+    def test_enrich_many_probes_the_host_once(self):
+        scheduler, store = make_scheduler(self)
+        for index in range(5):
+            scheduler.submit(argv=SHORT, cwd=self.state_dir, serial_key=f"w{index}")
+        with mock.patch.object(scheduler, "admission_state", wraps=scheduler.admission_state) as probe:
+            jobs = scheduler.enrich_many(store.queued_jobs())
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(len(jobs), 5)
+
+    def test_zram_credit_extends_the_memory_budget(self):
+        scheduler, store = make_scheduler(
+            self,
+            limits={"max_concurrent": 8, "pools": {"normal": 8}},
+            resources={"swap_credit": 1.0, "memory_headroom": 1.0},
+        )
+        scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w0", memory_mb=1)
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, pool="normal", serial_key="w1", memory_mb=5000)
+        with mock.patch.object(platform, "available_memory_mb", return_value=3000), \
+                mock.patch.object(platform, "zram_credit_mb", return_value=0):
+            self.assertEqual(len(scheduler.tick()), 1)
+        self.assertEqual(store.get(second["id"])["state"], "queued")
+        with mock.patch.object(platform, "available_memory_mb", return_value=3000), \
+                mock.patch.object(platform, "zram_credit_mb", return_value=2500):
+            self.assertEqual(scheduler.tick(), [second["id"]])
 
     def test_queue_position_counts_ahead(self):
         scheduler, _ = make_scheduler(self)
@@ -203,6 +326,22 @@ class TestLifecycle(helpers.AjqTestCase):
         scheduler.cancel(job["id"])
         self.assertTrue(wait_for_state(scheduler, job["id"], {"canceled", "timeout", "failed"}))
         self.assertEqual(store.get(job["id"])["kill_reason"], "canceled")
+
+    def test_cancel_without_a_local_runner_kills_the_recorded_pid(self):
+        """A job started by another daemon (no local cancel event) still dies."""
+        scheduler, store = make_scheduler(self)
+        job = scheduler.submit(
+            argv=[PY, "-c", "import time; time.sleep(30)"], cwd=self.state_dir
+        )
+        scheduler.tick()
+        pid = store.get(job["id"])["pid"]
+        self.assertGreater(pid, 0)
+        # simulate the other-daemon case: this scheduler has no event for it
+        with scheduler._lock:
+            scheduler._running.pop(job["id"], None)
+        scheduler.cancel(job["id"])
+        self.assertTrue(wait_for_state(scheduler, job["id"], {"canceled", "failed", "timeout"}))
+        self.assertTrue(helpers.wait_until(lambda: not _pid_alive(pid), timeout=5.0))
 
     def test_finish_populates_estimate_cache(self):
         from ajq import estimate as est
