@@ -1308,8 +1308,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.version:
         return _cmd_version(args)
     if not args.cmd:
-        parser.print_help()
-        return 0
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.print_help()
+            return 0
+        if not _require_daemon():
+            return 1
+        from . import tui
+
+        return tui.run()
     if not _need_daemon(args.cmd):
         return int(args.func(args))
     if not _require_daemon():

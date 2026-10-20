@@ -52,6 +52,7 @@ flowchart LR
 
 | Piece | Invoke | What it does |
 | --- | --- | --- |
+| `ajq` | `ajq` (in a terminal) | Live view of running and queued jobs with ticking elapsed time; select a job to follow its output, `/` to search it |
 | `ajq submit` | `ajq submit -- pytest -q` | Queue a command; returns a job id, not a hang |
 | `ajq wait` | `ajq wait <id> --tail 80` | Block until terminal; one call returns the final state and the log; exit 0 only for `done` |
 | `ajq status` | `ajq status <id> --fields state,elapsed_s` | State, queue position, ETAs, output size — only the keys you ask for |
