@@ -170,6 +170,28 @@ class TestCliInstall(InstallerCase):
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
 
+    def registry(self):
+        return pathlib.Path(self.home) / ".local" / "share" / "ajq" / "installed.txt"
+
+    def test_the_installed_ref_is_recorded(self):
+        self.install("--target", "claude")
+        lines = self.registry().read_text(encoding="utf-8").splitlines()
+        version_lines = [line for line in lines if line.startswith("version|")]
+        self.assertEqual(len(version_lines), 1, lines)
+        key, ref, version = version_lines[0].split("|")
+        self.assertEqual(key, "version")
+        self.assertTrue(ref.strip(), "the recorded ref is empty")
+        source = (REPO / "src" / "ajq" / "__init__.py").read_text(encoding="utf-8")
+        expected = re.search(r'__version__ = "([^"]+)"', source).group(1)
+        self.assertEqual(version.strip(), expected)
+
+    def test_the_uninstall_drops_the_version_line(self):
+        self.install("--target", "claude")
+        self.uninstall()
+        registry = self.registry()
+        if registry.exists():
+            self.assertNotIn("version|", registry.read_text(encoding="utf-8"))
+
 
 class TestJsonMerge(InstallerCase):
     def test_claude_settings_keep_herdr_entry(self):

@@ -278,6 +278,38 @@ registry_drop() {
 }
 registry_keys() { [ -f "$REGISTRY" ] && cut -d'|' -f1 "$REGISTRY" || true; }
 
+# The ref the payload came from: the network ref when the payload was fetched,
+# the local checkout otherwise. `ajq update` reads it to know what is installed.
+installed_ref() {
+  if [ -n "${AJQ_BOOTSTRAPPED:-}" ]; then
+    echo "$REF"
+    return 0
+  fi
+  if [ -d "$SCRIPT_DIR/.git" ]; then
+    local described
+    described="$(git -C "$SCRIPT_DIR" describe --tags --exact-match 2>/dev/null)"
+    if [ -n "$described" ]; then echo "$described"; return 0; fi
+    described="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [ -n "$described" ]; then echo "$described"; return 0; fi
+  fi
+  echo "unknown"
+}
+
+# The version string of the payload. It can lag behind the ref, so the ref is
+# what `ajq update` compares.
+payload_version() {
+  local value
+  value="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' "$SCRIPT_DIR/src/ajq/__init__.py" 2>/dev/null | head -1)"
+  echo "${value:-unknown}"
+}
+
+# The version line is replaced, not merged: one ref, one version.
+registry_set_version() {
+  local ref="$1" version="$2"
+  registry_drop "version"
+  registry_set "version" "$ref" "$version"
+}
+
 # ---- shared files (hooks + runtime) -----------------------------------------
 install_shared_files() {
   local rp src dest installed=()
@@ -676,6 +708,11 @@ do_install() {
   local targets=("$@")
   log "== ajq: install =="
   build_zipapp
+  local installed_version_ref installed_version_number
+  installed_version_ref="$(installed_ref)"
+  installed_version_number="$(payload_version)"
+  registry_set_version "$installed_version_ref" "$installed_version_number"
+  log "  + version: $installed_version_number ($installed_version_ref)"
   install_shared_files
   install_config
   install_daemon
@@ -695,8 +732,10 @@ do_uninstall() {
   local id
   for id in $(registry_keys); do
     [ "$id" = shared ] && continue
+    [ "$id" = version ] && continue
     uninstall_harness "$id"
   done
+  registry_drop "version"
   uninstall_shared_files
   [ "$WITH_DAEMON" = 1 ] && uninstall_daemon
   rm -f "$AJQ_BIN"

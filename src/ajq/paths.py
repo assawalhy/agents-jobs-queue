@@ -29,6 +29,11 @@ def _config_home() -> str:
     return value if value else os.path.join(_home(), ".config")
 
 
+def _data_home() -> str:
+    value = os.environ.get("XDG_DATA_HOME") or ""
+    return value if value else os.path.join(_home(), ".local", "share")
+
+
 def _runtime_dir() -> str:
     """Socket directory: XDG_RUNTIME_DIR when present, else a private TMPDIR dir."""
     runtime = os.environ.get("XDG_RUNTIME_DIR") or ""
@@ -41,6 +46,9 @@ def _runtime_dir() -> str:
 STATE_DIR = os.environ.get("AJQ_STATE_DIR") or os.path.join(_state_home(), APP)
 CONFIG_PATH = os.environ.get("AJQ_CONFIG") or os.path.join(_config_home(), APP, "config.json")
 SOCKET_PATH = os.environ.get("AJQ_SOCKET") or os.path.join(_runtime_dir(), "ajqd.sock")
+# The installer's data directory. It must match the one in install.sh, which
+# uses $XDG_DATA_HOME/ajq, so the CLI can find what the installer recorded.
+DATA_DIR = os.path.join(_data_home(), APP)
 DB_PATH = os.path.join(STATE_DIR, "state.db")
 
 
@@ -62,6 +70,11 @@ def job_color_path(job_id: str) -> str:
 
 def job_meta_path(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "meta.json")
+
+
+def installed_registry() -> str:
+    """The installer's registry: the installed harnesses and the installed ref."""
+    return os.path.join(DATA_DIR, "installed.txt")
 
 
 def ensure_dir(path: str, mode: int = 0o700) -> str:
