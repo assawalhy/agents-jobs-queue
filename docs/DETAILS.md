@@ -44,6 +44,7 @@ daemon must be restarted for a resource change to reach a running daemon (unlike
 | `ajq config [--print-default\|--seed\|--force-config]` | Inspect or seed the config |
 | `ajq doctor` | Backend, socket, unit state, linger, memory, guard mode |
 | `ajq prune [--older-than D\|--all] [--keep-files] [--yes]` | Delete finished jobs and their captured output |
+| `ajq update [--check] [--yes] [--dry-run] [--ref REF]` | Check the repo for a newer release or tag, and install that exact ref |
 | `ajq daemon serve\|ensure\|status\|stop` | Daemon control |
 
 ### The terminal view
@@ -73,6 +74,7 @@ job with the colour environment variables set, keeps the raw bytes in
 `out.log`, and the view reads the raw one. The agents read the plain one,
 so a captured log never spends tokens on escape codes.
 
+### Cheap polling for agents
 
 `--fields a,b,c` (alias `--select`) prints only the keys you name, so an agent
 never needs to pipe `--json` into a `python3 -c` parser:
@@ -117,6 +119,33 @@ Submit with `--cwd <dir>` rather than a `cd <dir> &&` prefix: the prefix buys
 nothing (the daemon runs each job in one directory) and it is what pushes the
 command out of the column. `ajq guard --explain` turns that prefix into `--cwd`
 in the line it suggests.
+
+### Checking for updates
+
+`ajq update` compares what is installed with what the repo publishes, and
+installs the newer one.
+
+- The versions come from the repo's releases and tags. The `releases.atom`
+  feed is the primary source: it needs no token and has no rate limit. The
+  GitHub API is the second source, for the published release and its note.
+- The installed version comes from the ref the installer recorded in
+  `~/.local/share/ajq/installed.txt`, not from the version string in the code.
+  The version string has not been bumped since `0.1.0`, so a code based
+  comparison would report an update for a user who already runs the newest tag.
+- The update installs a release or a tag, never the latest commit on main. The
+  installer script and the payload it fetches are both pinned to that ref, so
+  the two can never come from different places.
+- `ajq update --check` reports and changes nothing. It exits 0 when the
+  installed version is the latest, 1 when a newer version exists, and 2 when
+  the check could not be made.
+- `ajq update` asks before it runs, and it says how many jobs are running
+  first, because the installer restarts the daemon and that kills the running
+  children.
+- `--ref main` asks for the unreleased build. `--dry-run` prints the command
+  without running it.
+
+The check is never automatic. It costs a network round trip, and a command
+that phones home on every call is a command an agent pays for.
 
 ### States
 
@@ -412,6 +441,12 @@ tokens on escape codes. `color.log` holds the same bytes as the child wrote
 them, escape codes included, and the terminal view draws that one. The output
 cap counts the raw bytes, and `ajq prune` removes both files with the job
 directory.
+
+**The install registry.** `~/.local/share/ajq/installed.txt` lists what the
+installer put where: one line per harness, one for the shared files, and one
+`version|<ref>|<code version>` line naming the ref that was installed. `ajq
+update` reads that line to know what is installed, and the uninstall drops it
+with the rest.
 
 Jobs are argv-only by default — the daemon never runs `sh -c` unless you pass
 `--shell`.
