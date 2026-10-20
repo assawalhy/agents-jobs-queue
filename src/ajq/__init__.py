@@ -13,6 +13,9 @@ Modules:
   scheduler  queue ordering, pool caps, admission, ETAs
   daemon     serve loop
   cli        command line interface
+  tui        curses view of the queue
+  ansi       escape sequences: the patterns and the streaming stripper
+  update     release and tag check, and the install of a pinned ref
 """
 
 __version__ = "0.1.0"
