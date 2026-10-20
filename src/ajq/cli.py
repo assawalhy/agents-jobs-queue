@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from . import __version__, daemon, paths, platform
 from . import guard as guard_mod
+from . import update as update_mod
 from .config import Config, default_config_json, load_config, seed_config
 from .protocol import ProtocolError, request
 from .store import TERMINAL_STATES
@@ -32,7 +33,9 @@ from .store import TERMINAL_STATES
 # is exactly when you want to print the template.  doctor deliberately does NOT
 # appear here: per the contract it starts the daemon and then reports on it, so
 # with an unreachable socket it prints one actionable line and exits 1.
-DAEMON_FREE = frozenset({"daemon", "version", "config", "guard"})
+# update is here too: it must work with the daemon down, and it only looks at
+# the running jobs on a best effort basis.
+DAEMON_FREE = frozenset({"daemon", "version", "config", "guard", "update"})
 _POLL_S = 0.2
 _READ_CHUNK = 65536
 _CMD_WIDTH = 48
@@ -1069,6 +1072,133 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return daemon.daemon_entry([args.action] + rest)
 
 
+def _echo(text: str, as_json: bool) -> None:
+    """A line for the human. In JSON mode it goes to stderr, so stdout stays one object."""
+    if as_json:
+        sys.stderr.write(f"ajq: {text}\n")
+    else:
+        print(text)
+
+
+def _running_jobs() -> int:
+    """How many jobs the daemon is running, or 0 when it does not answer.
+
+    The update command is daemon free, so this is a best effort lookup: a
+    daemon that is down or slow must not fail the command.
+    """
+    try:
+        response = _request({"op": "list", "states": ["running"], "limit": 200}, timeout=2.0)
+    except (ProtocolError, OSError):
+        return 0
+    if not response.get("ok"):
+        return 0
+    return len(response.get("jobs") or [])
+
+
+def _print_update_report(report: dict[str, Any]) -> None:
+    installed = report.get("installed_version") or "unknown"
+    installed_ref = report.get("installed_ref") or "-"
+    newest = report.get("latest_version") or "unknown"
+    newest_ref = report.get("latest_ref") or "-"
+    print(f"installed  {installed}  ({installed_ref})")
+    print(f"latest     {newest}  ({newest_ref})")
+    if not report.get("latest_version"):
+        state = "unknown"
+    elif report.get("update_available"):
+        state = "available"
+    else:
+        state = "not needed"
+    print(f"update     {state}")
+    note = report.get("note")
+    if note:
+        print(f"note       {note}")
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    """Check for a newer release and install it.
+
+    The check reads the release feed and the release API, so it needs the
+    network. The install runs the installer from the chosen ref, never from
+    main, and asks first unless `--yes` is given.
+    """
+    repo = getattr(args, "repo", None) or update_mod.REPO
+    installed = update_mod.read_installed()
+    harnesses = update_mod.read_harnesses()
+    candidates: list[dict[str, Any]] = []
+    problem = ""
+    try:
+        candidates = update_mod.fetch_candidates(repo)
+    except update_mod.UpdateError as exc:
+        # With an explicit ref the check is not needed to install it.
+        if not args.ref:
+            problem = str(exc)
+    newest = update_mod.latest(candidates) if candidates else None
+    report = update_mod.build_report(installed, newest)
+    target = args.ref or (str(newest.get("ref") or "") if newest else "")
+
+    if args.check:
+        if problem:
+            _fail(f"cannot check for updates: {problem}")
+        if args.json:
+            _emit(report)
+        else:
+            _print_update_report(report)
+        if problem:
+            return 2
+        return 1 if report.get("update_available") else 0
+
+    if not target:
+        _fail(f"cannot check for updates: {problem or 'no release found'}")
+        return 1
+    if not args.ref and installed.get("ref") and installed["ref"] == target:
+        if args.json:
+            _emit(report)
+        else:
+            _print_update_report(report)
+            print(f"already installed at {target}")
+        return 0
+
+    command = update_mod.install_command(repo, target, harnesses)
+    _echo(f"command  {command}", args.json)
+    if args.dry_run:
+        if args.json:
+            _emit(report)
+        else:
+            print("dry run: nothing installed")
+        return 0
+
+    running = _running_jobs()
+    if running:
+        _echo(
+            f"note      the daemon has {running} running job(s); the installer "
+            "restarts the unit and kills them",
+            args.json,
+        )
+    if not args.yes:
+        question = "install it? [y/N] "
+        if running:
+            question = (
+                f"install it and restart the daemon, killing {running} running job(s)? [y/N] "
+            )
+        if not _confirm(question):
+            print("cancelled")
+            return 0
+
+    try:
+        update_mod.install(repo, target, harnesses)
+    except update_mod.UpdateError as exc:
+        _fail(str(exc))
+        return 1
+    report["installed_version"] = update_mod.version_of(target) or report.get("latest_version")
+    report["installed_ref"] = target
+    report["update_available"] = False
+    if args.json:
+        _emit(report)
+    else:
+        print(f"installed {target}")
+    return 0
+
+
 def _cmd_version(args: argparse.Namespace) -> int:
     """Print the version.
 
@@ -1277,6 +1407,26 @@ def _build_parser() -> argparse.ArgumentParser:
     config.add_argument("--force", action="store_true", help="with --seed, overwrite an existing file")
 
     add("doctor", "report backend, socket, unit, linger, memory", _cmd_doctor)
+
+    update_cmd = add(
+        "update",
+        "check for a newer release and install it",
+        _cmd_update,
+    )
+    update_cmd.add_argument("--check", action="store_true", help="report only, change nothing")
+    update_cmd.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    update_cmd.add_argument("--dry-run", action="store_true", help="print the command and stop")
+    update_cmd.add_argument(
+        "--ref",
+        metavar="REF",
+        help="install this ref instead of the newest one (main for the unreleased build)",
+    )
+    update_cmd.add_argument(
+        "--repo",
+        metavar="REPO",
+        default=update_mod.REPO,
+        help=f"the GitHub repo to check (default {update_mod.REPO})",
+    )
 
     daemon_cmd = add("daemon", "serve|run|ensure|stop|status", _cmd_daemon)
     daemon_cmd.add_argument(
