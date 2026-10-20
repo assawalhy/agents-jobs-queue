@@ -6,7 +6,7 @@
 (`ping submit status list cancel wait stats estimates_clear shutdown`).
 
 Everything the daemon writes lives under `paths.STATE_DIR` (0700): `state.db`,
-`ajqd.pid`, `ajqd.log` and `jobs/<id>/{out.log,meta.json}`.
+`ajqd.pid`, `ajqd.log` and `jobs/<id>/{out.log,color.log,meta.json}`.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional, Sequence
 from . import __version__, estimate, paths, platform, protocol
 from .backends import get_backend
 from .config import Config, load_config
-from .exec import JobRunner
+from .exec import JobRunner, color_env
 from .scheduler import Scheduler
 from .store import TERMINAL_STATES, Store
 
@@ -495,7 +495,7 @@ class _Server:
         # admission check, never the job.
         self.backend = get_backend(wanted, self.config)
         self.backend_name = str(getattr(self.backend, "name", wanted))
-        self.runner = JobRunner(self.backend)
+        self.runner = JobRunner(self.backend, env=color_env(self.config))
         self.scheduler = Scheduler(self.store, self.config, self.runner, self.backend)
         self._bind()
         self._install_signals()

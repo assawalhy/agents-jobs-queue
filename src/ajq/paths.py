@@ -56,6 +56,10 @@ def job_out_path(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "out.log")
 
 
+def job_color_path(job_id: str) -> str:
+    return os.path.join(job_dir(job_id), "color.log")
+
+
 def job_meta_path(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "meta.json")
 

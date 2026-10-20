@@ -48,7 +48,19 @@ class Handle:
 class ResourceBackend(Protocol):
     name: str
 
-    def spawn(self, job: dict, argv: list[str]) -> Handle: ...
+    def spawn(
+        self,
+        job: dict,
+        argv: list[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> Handle:
+        """Spawn one job and return its handle.
+
+        `env` holds the extra environment variables for the child, the colour
+        variables mostly. A backend adds them to the environment the child
+        inherits; it never drops a variable the caller set.
+        """
+        ...
 
     def rss_mb(self, pid: int) -> int | None: ...
 

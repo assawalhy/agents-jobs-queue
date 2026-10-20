@@ -62,6 +62,7 @@ DEFAULTS: dict = {
     },
     "hooks": {"guard_mode": "warn"},
     "daemon": {"unit": "ajqd.service", "tick_s": 0.5, "socket": None},
+    "output": {"color": "on"},
 }
 
 # (env var, dotted key path, value kind)
@@ -77,6 +78,7 @@ ENV_KEYS: tuple[tuple[str, str, str], ...] = (
     ("AJQ_BACKEND", "resources.backend", "str"),
     ("AJQ_LIGHT_THRESHOLD_S", "estimates.light_threshold_s", "int"),
     ("AJQ_KILL_GRACE_S", "defaults.kill_grace_s", "int"),
+    ("AJQ_OUTPUT_COLOR", "output.color", "str"),
 )
 
 _DOC: dict[str, str] = {
@@ -86,6 +88,7 @@ _DOC: dict[str, str] = {
     "estimates": "Welford duration cache; light_threshold_s promotes cheap jobs to the light pool.",
     "hooks": "guard_mode for PreToolUse guards: warn | block | off.",
     "daemon": "Unit name, serve tick interval, socket override (null = default path).",
+    "output": "color: on | off. Only 'on' sets the colour environment variables for the child; any other value turns the forcing off.",
 }
 
 _warned: set[str] = set()
