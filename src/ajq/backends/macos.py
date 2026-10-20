@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any
+from typing import Any, Optional
 
 from .. import platform
 from .base import Handle, effective_resources, resolve_resources
@@ -40,7 +40,12 @@ class MacosBackend:
         return platform.rss_mb(pid)
 
     # -- lifecycle -------------------------------------------------------
-    def spawn(self, job: dict, argv: list[str]) -> Handle:
+    def spawn(
+        self,
+        job: dict,
+        argv: list[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> Handle:
         nice = self.resources(job)["nice"]
 
         def preexec() -> None:  # runs in the child, between fork and exec
@@ -60,6 +65,9 @@ class MacosBackend:
             start_new_session=True,
             close_fds=True,
             preexec_fn=preexec if nice > 0 else None,
+            # Popen replaces the whole environment, so the child keeps the
+            # daemon's own variables and only adds the ones the runner sets.
+            env={**os.environ, **(env or {})},
         )
         pid = pop.pid
         self._live[pid] = pop

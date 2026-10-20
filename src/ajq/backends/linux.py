@@ -212,7 +212,7 @@ class LinuxBackend:
                 self.nice_applied_by = "argv-wrapper" if shutil.which("nice") else "none"
         return self._nice_supported
 
-    def command(self, job: dict, argv: list[str]) -> list[str]:
+    def command(self, job: dict, argv: list[str], env: Optional[dict[str, str]] = None) -> list[str]:
         limits = self.resources(job)
         memory = limits["memory_mb"]
         if self.soft_cap():
@@ -241,14 +241,23 @@ class LinuxBackend:
             command += [f"--working-directory={cwd}"]
         for prop in props:
             command += ["-p", prop]
+        # `--scope` inherits the caller's environment, and systemd-run 260 has no
+        # --unsetenv, so setting the variables is enough to add or replace one.
+        for name, value in (env or {}).items():
+            command += ["-E", f"{name}={value}"]
         return [*command, *limits["extra_args"], "--", *payload]
 
-    def spawn(self, job: dict, argv: list[str]) -> Handle:
+    def spawn(
+        self,
+        job: dict,
+        argv: list[str],
+        env: Optional[dict[str, str]] = None,
+    ) -> Handle:
         if self._fallback is not None:
-            return self._fallback.spawn(job, argv)
+            return self._fallback.spawn(job, argv, env=env)
         try:
             pop = subprocess.Popen(
-                self.command(job, list(argv)),
+                self.command(job, list(argv), env),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -257,7 +266,7 @@ class LinuxBackend:
             )
         except OSError as exc:
             self._degrade(f"systemd-run unusable: {exc}")
-            return self._fallback.spawn(job, argv)
+            return self._fallback.spawn(job, argv, env=env)
         return self._handle(job, pop)
 
     def _handle(self, job: dict, pop: subprocess.Popen) -> Handle:

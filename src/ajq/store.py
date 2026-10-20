@@ -572,8 +572,8 @@ class Store:
     def prune(self, keep_days: int = 14, remove_files: bool = True) -> int:
         """Drop terminal job rows older than keep_days.
 
-        With remove_files the per-job directory (out.log, meta.json) goes too,
-        otherwise the queue is cleaned but the disk keeps filling up.
+        With remove_files the per-job directory (out.log, color.log, meta.json)
+        goes too, otherwise the queue is cleaned but the disk keeps filling up.
         """
         cutoff = time.time() - max(0, int(keep_days)) * 86400.0
         marks = ",".join("?" for _ in TERMINAL_STATES)

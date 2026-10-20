@@ -46,7 +46,33 @@ daemon must be restarted for a resource change to reach a running daemon (unlike
 | `ajq prune [--older-than D\|--all] [--keep-files] [--yes]` | Delete finished jobs and their captured output |
 | `ajq daemon serve\|ensure\|status\|stop` | Daemon control |
 
-### Cheap polling for agents
+### The terminal view
+
+Running `ajq` with no subcommand in a terminal opens a curses view of the
+queue. It is the same queue as `ajq list`, plus the output of the selected
+job, and the keys are fixed:
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the job selection |
+| `j` / `k` | Scroll the log one line |
+| `g` / `G` | Log top / log bottom; `G` resumes following |
+| PgUp / PgDn, `Ctrl-u` / `Ctrl-d`, space | Page the log |
+| `/`, `n` / `N`, `Esc` | Search the log, next match, previous match, clear |
+| `a` | Show or hide the finished jobs |
+| `q` | Quit |
+
+The wheel scrolls the log when the pointer is over it and moves the
+selection when the pointer is over the table, and a click on a row picks
+that job. The view opens only when both stdin and stdout are terminals, so
+an agent that calls bare `ajq` still gets the help text.
+
+The log pane draws the colours the tool produced. The daemon starts every
+job with the colour environment variables set, keeps the raw bytes in
+`color.log` and the same bytes with the escape sequences removed in
+`out.log`, and the view reads the raw one. The agents read the plain one,
+so a captured log never spends tokens on escape codes.
+
 
 `--fields a,b,c` (alias `--select`) prints only the keys you name, so an agent
 never needs to pipe `--json` into a `python3 -c` parser:
@@ -223,7 +249,8 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
                          "docker": 600, "check": 30, "unknown": 60 }
   },
   "hooks": { "guard_mode": "warn" },
-  "daemon": { "unit": "ajqd.service", "tick_s": 0.5, "socket": null }
+  "daemon": { "unit": "ajqd.service", "tick_s": 0.5, "socket": null },
+  "output": { "color": "on" }
 }
 ```
 
@@ -260,6 +287,7 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
 | `daemon.unit` | `ajqd.service` | systemd unit name |
 | `daemon.tick_s` | 0.5 | Scheduler tick interval |
 | `daemon.socket` | null | Socket path override; null uses `/run/user/<uid>/ajq/ajqd.sock` |
+| `output.color` | `on` | Start every job with the colour environment variables, so the tool writes escape codes the terminal view can draw. `off` leaves the environment alone. The daemon reads it at start-up, so a change needs `ajq daemon stop` and `ajq daemon ensure` |
 
 ### Memory, admission, and concurrency
 
@@ -361,6 +389,7 @@ Rules:
 ```
 ~/.local/state/ajq/state.db                       SQLite (WAL): jobs, estimates
 ~/.local/state/ajq/jobs/<id>/out.log              captured output, mode 0600
+~/.local/state/ajq/jobs/<id>/color.log            the same bytes with the colours in
 ~/.local/state/ajq/jobs/<id>/meta.json            the same metadata as a sidecar
 ~/.local/state/ajq/ajqd.pid                        live daemon pid
 ~/.local/state/ajq/ajqd.lock                       the single-daemon flock
@@ -376,6 +405,13 @@ with no local runner kills the process group recorded in `state.db`.
 
 A daemon crash leaves `running` jobs marked `lost` on the next start; their
 output files stay readable. `ajq prune` removes finished jobs and their output.
+
+**Two log files per job.** `out.log` holds the captured output with the escape
+sequences removed, so every reader gets plain text and an agent never spends
+tokens on escape codes. `color.log` holds the same bytes as the child wrote
+them, escape codes included, and the terminal view draws that one. The output
+cap counts the raw bytes, and `ajq prune` removes both files with the job
+directory.
 
 Jobs are argv-only by default — the daemon never runs `sh -c` unless you pass
 `--shell`.

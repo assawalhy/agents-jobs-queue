@@ -18,7 +18,7 @@ import helpers
 from ajq import platform
 from ajq.backends import get_backend
 from ajq.backends.base import Handle
-from ajq.exec import JobRunner
+from ajq.exec import TRUNCATION_MARKER, JobRunner, color_env
 
 PY = "python3"
 
@@ -50,6 +50,19 @@ class TestJobRunner(helpers.AjqTestCase):
         from ajq import paths
 
         with open(paths.job_out_path(job_id), encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+    def raw(self, job_id):
+        """The bytes of `color.log`, the child's output as it came."""
+        from ajq import paths
+
+        with open(paths.job_color_path(job_id), "rb") as handle:
+            return handle.read()
+
+    def out_bytes(self, job_id):
+        from ajq import paths
+
+        with open(paths.job_out_path(job_id), "rb") as handle:
             return handle.read()
 
     def test_success_records_exit_code_and_output(self):
@@ -86,6 +99,78 @@ class TestJobRunner(helpers.AjqTestCase):
         self.assertTrue(result.truncated)
         self.assertLessEqual(len(self.out("j-big").encode()), 2000 + 4096)
 
+    def test_colour_output_lands_in_both_log_files(self):
+        """`color.log` keeps the raw bytes, `out.log` the plain text."""
+        job = make_job(
+            self.state_dir,
+            "j-color",
+            [PY, "-c", "import sys; sys.stdout.write(chr(27) + '[31mred' + chr(27) + '[0m\\n')"],
+        )
+        result = self.runner().run(job, threading.Event())
+        self.assertEqual(result.exit_code, 0)
+        raw = self.raw("j-color")
+        self.assertIn(b"\x1b[31m", raw)
+        self.assertIn(b"\x1b[0m", raw)
+        self.assertEqual(self.out("j-color"), "red\n")
+
+    def test_out_log_never_holds_an_escape_sequence(self):
+        job = make_job(
+            self.state_dir,
+            "j-plain",
+            [PY, "-c", "import sys; sys.stdout.write(chr(27) + '[31mred' + chr(27) + '[0m\\n')"],
+        )
+        self.runner().run(job, threading.Event())
+        self.assertNotIn(b"\x1b", self.out_bytes("j-plain"))
+        self.assertEqual(self.out("j-plain"), "red\n")
+
+    def test_a_sequence_split_across_a_chunk_boundary_is_stripped(self):
+        """The escape sequence starts near the end of a 64 KiB read."""
+        job = make_job(
+            self.state_dir,
+            "j-split",
+            [
+                PY,
+                "-c",
+                "import sys\n"
+                "sys.stdout.write('x' * 65530)\n"
+                "sys.stdout.write(chr(27) + '[31mred\\n')\n",
+            ],
+        )
+        result = self.runner().run(job, threading.Event())
+        self.assertEqual(result.exit_code, 0)
+        self.assertNotIn(b"\x1b", self.out_bytes("j-split"))
+        self.assertTrue(self.out("j-split").endswith("red\n"))
+
+    def test_the_byte_cap_counts_the_raw_bytes(self):
+        job = make_job(
+            self.state_dir,
+            "j-cap",
+            [PY, "-c", "import sys; sys.stdout.write(chr(27) + '[31m' + 'x' * 5000)"],
+            max_output_bytes=100,
+        )
+        result = self.runner().run(job, threading.Event())
+        self.assertTrue(result.truncated)
+        raw = self.raw("j-cap")
+        self.assertEqual(len(raw), 100 + len(TRUNCATION_MARKER))
+        self.assertEqual(result.out_bytes, 100 + len(TRUNCATION_MARKER))
+        self.assertIn(b"\x1b[31m", raw)
+        self.assertIn(TRUNCATION_MARKER, raw)
+        self.assertIn(TRUNCATION_MARKER, self.out_bytes("j-cap"))
+
+    def test_the_child_environment_reaches_the_child(self):
+        job = make_job(
+            self.state_dir,
+            "j-env",
+            [PY, "-c", "import os; print(os.environ.get('AJQ_TEST_COLOR', ''))"],
+        )
+        runner = JobRunner(
+            self.runner().backend,
+            poll_interval=0.05,
+            env={"AJQ_TEST_COLOR": "1"},
+        )
+        runner.run(job, threading.Event())
+        self.assertIn("1", self.out("j-env"))
+
     def test_cancel_event_stops_the_job(self):
         job = make_job(self.state_dir, "j-cancel", [PY, "-c", "import time; time.sleep(30)"])
         cancel = threading.Event()
@@ -118,6 +203,51 @@ class TestJobRunner(helpers.AjqTestCase):
         )
         result = self.runner().run(job, threading.Event())
         self.assertEqual(result.kill_reason, "memory_limit")
+
+
+class TestColorEnv(unittest.TestCase):
+    """The environment variables that make a tool colour its output."""
+
+    def config(self, value):
+        return helpers.load_config(output={"color": value})
+
+    def test_only_on_turns_the_forcing_on(self):
+        for value in ("off", "ON", "yes", ""):
+            self.assertEqual(color_env(self.config(value)), {}, value)
+
+    def test_the_colour_variables_are_set_when_the_config_says_on(self):
+        env = color_env(self.config("on"))
+        self.assertEqual(env["FORCE_COLOR"], "1")
+        self.assertEqual(env["CLICOLOR_FORCE"], "1")
+        self.assertEqual(env["CLICOLOR"], "1")
+        self.assertEqual(env["PY_COLORS"], "1")
+        self.assertEqual(env["CARGO_TERM_COLOR"], "always")
+
+    def test_term_is_set_when_the_daemon_term_is_unusable(self):
+        from unittest import mock
+
+        for term in ("", "dumb"):
+            with mock.patch.dict(os.environ, {"TERM": term}):
+                self.assertEqual(color_env(self.config("on"))["TERM"], "xterm-256color")
+
+    def test_term_is_left_alone_when_the_daemon_term_is_usable(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            self.assertNotIn("TERM", color_env(self.config("on")))
+
+    def test_the_daemon_no_color_is_not_overridden(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertNotIn("NO_COLOR", color_env(self.config("on")))
+
+    def test_the_config_default_is_on_and_the_env_var_overrides_it(self):
+        from unittest import mock
+
+        self.assertEqual(helpers.load_config().get("output.color"), "on")
+        with mock.patch.dict(os.environ, {"AJQ_OUTPUT_COLOR": "off"}):
+            self.assertEqual(helpers.load_config().get("output.color"), "off")
 
 
 def _user_systemd_available() -> bool:
@@ -204,6 +334,18 @@ class TestBackends(helpers.AjqTestCase):
         for bad in ("", None, "/definitely/not/here"):
             command = backend.command({"id": "j-wd2", "cwd": bad}, ["true"])
             self.assertFalse([c for c in command if c.startswith("--working-directory=")])
+
+    def test_linux_backend_sets_the_child_environment(self):
+        """systemd-run has no --unsetenv, so the variables are set with -E."""
+        command = self._linux().command({"id": "j-env"}, ["true"], {"FORCE_COLOR": "1"})
+        self.assertIn("-E", command)
+        self.assertIn("FORCE_COLOR=1", command)
+        # the variables belong to systemd-run, so they come before the command
+        self.assertLess(command.index("FORCE_COLOR=1"), command.index("--"))
+
+    def test_linux_backend_without_an_environment_keeps_the_command_clean(self):
+        command = self._linux().command({"id": "j-env"}, ["true"])
+        self.assertNotIn("-E", command)
 
     def _linux(self, cgroup_v2=True, **kwargs):
         from ajq.backends.linux import LinuxBackend
