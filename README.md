@@ -62,6 +62,7 @@ flowchart LR
 | `ajq stats` | `ajq stats` | Estimate cache with real MAPE accuracy per signature |
 | `ajq doctor` | `ajq doctor` | Backend, socket, unit state, linger, memory, guard mode |
 | `ajq prune` | `ajq prune --all` | Drop finished jobs and their output |
+| `ajq update` | `ajq update --check` | Say whether a newer release or tag exists, and install that exact ref |
 | `ajq` skill | auto-loaded | Tells the agent when to submit instead of running |
 | hooks | automatic | OpenCode plugin, Claude/Codex/Kiro hooks, Pi extension |
 
