@@ -5,7 +5,8 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    # the feature branches too, so a stacked pull request gets its checks
+    branches: [main, "feat/**"]
 
 jobs:
   tests:
