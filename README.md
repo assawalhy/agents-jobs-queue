@@ -52,7 +52,7 @@ flowchart LR
 
 | Piece | Invoke | What it does |
 | --- | --- | --- |
-| `ajq` | `ajq` (in a terminal) | Live view of running and queued jobs with ticking elapsed time; select a job to follow its output, `/` to search it |
+| `ajq` | `ajq` (in a terminal) | Live view of running and queued jobs with ticking elapsed time; the arrows pick the job, `j`/`k` scroll its log, `/` searches it, and the log keeps the colours the tool produced |
 | `ajq submit` | `ajq submit -- pytest -q` | Queue a command; returns a job id, not a hang |
 | `ajq wait` | `ajq wait <id> --tail 80` | Block until terminal; one call returns the final state and the log; exit 0 only for `done` |
 | `ajq status` | `ajq status <id> --fields state,elapsed_s` | State, queue position, ETAs, output size — only the keys you ask for |
@@ -72,6 +72,7 @@ flowchart LR
 - 🧠 **Estimates come from a real cache**: Welford mean + 0.5σ over `kind|tool|dirs|filecount`, cold-starting from per-kind defaults. `ajq stats` prints MAPE so the accuracy is checkable.
 - 🪟 **macOS cannot hard-cap a job's RAM** — no cgroup write access, and `RLIMIT_AS` breaks Node/JVM/Docker. The free-RAM admission gate does the work there and `ajq doctor` says so.
 - ⚠️ The guard defaults to `warn` (it tells the agent, it does not block). On Claude/Codex/Kiro that is a note injected before the call; on OpenCode V2 it is a note appended to the tool result. Set `hooks.guard_mode` to `block` to deny heavy commands outright.
+- 🎨 **The terminal view shows the colours the tool produced**: every job starts with the colour environment variables on, the daemon keeps the raw bytes in `color.log` and the plain text in `out.log`, and the agents read the plain one. `output.color: "off"` turns the forcing off.
 - 🧩 Kilo, Kimi, DeepSeek and Cursor get the skill but no hooks — no verified hook API for them.
 
 ## 📄 License
