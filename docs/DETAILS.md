@@ -9,14 +9,14 @@ README covers what it is and how to install it.
 | --- | --- | --- |
 | Concurrency | `max_concurrent: 8` | Caps every pool at once |
 | Pools | `heavy 2 · normal 4 · service 3 · light 6` | One cap per tier; the tier comes from the job's kind and estimate |
-| Worktree serialization | `serial_key` = git worktree root | Two agents in one checkout never run overlapping commands |
+| Worktree serialization | `serial_key` = git worktree root | Two agents in one checkout never run overlapping commands. Jobs in the `light` pool skip the gate: they neither wait on a busy key nor hold it, unless `limits.serial_light` is `true` |
 | Memory admission | `memory_headroom: 1.2`, `swap_credit: 1.0` | A job starts only when `MemAvailable + zram credit >= memory_limit × 1.2`. With nothing running, the head job starts anyway |
 | Pressure gate | `admission: psi_memory_max 5, psi_cpu_max 70, temp_max_c 95` | While a job runs, no further job starts while PSI memory `full avg10`, PSI CPU `some avg10`, or the 30 s average CPU temperature is over its limit. Running jobs are never killed for it |
 | Per-job memory | `memory_mb: 2048` (or `pool_memory_mb[pool]`), `hard_factor: 1.5` | Linux, cgroup v2 with zram as the first swap: `MemoryHigh` at the cap (reclaim to zram, no kill), `MemoryMax` at cap × 1.5, `MemorySwapMax` at the cap. Otherwise `MemoryMax` at the cap with `MemorySwapMax=0`. `OOMPolicy=stop` in both. The RSS watchdog kills at the same ceiling as `MemoryMax` |
 | CPU | `cpu_percent: 200`, `nice: 10` | Linux: `CPUQuota` + `Nice`. Both: `setpriority` |
 | Timeout | `timeout_s: 1800` | SIGTERM to the process group, SIGKILL after `kill_grace_s` (10s), state `timeout` |
 | Output size | `max_output_bytes: 8 MiB` | Appends a truncation marker and terminates the job. `--keep-going-on-output` only stops recording |
-| Forced start | `ajq start` | Starts the whole queued backlog at once: the pool caps, `max_concurrent` and the admission gate are bypassed for that call, and the per-job `MemoryMax`/`CPUQuota` still apply. It prompts first unless `--yes`. The worktree serial key still holds unless `--ignore-serial` |
+| Forced start | `ajq start` | Starts the whole queued backlog at once: the pool caps, `max_concurrent` and the admission gate are bypassed for that call, and the per-job `MemoryMax`/`CPUQuota` still apply. It prompts first unless `--yes`. The worktree serial key still holds for jobs outside the `light` pool unless `--ignore-serial`; `light` jobs skip it unless `limits.serial_light` is `true` |
 
 Every guard is overridable per submit (`--timeout`, `--max-output-bytes`,
 `--pool`, `--priority`, `--memory-mb`, `--cpu-percent`) or in
@@ -255,7 +255,7 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
 ```json
 {
   "limits": {
-    "max_concurrent": 8,
+    "max_concurrent": 8, "serial_light": false,
     "pools": { "heavy": 2, "normal": 4, "service": 3, "light": 6 }
   },
   "defaults": {
@@ -286,6 +286,7 @@ accepted as flat keys too, so `"limits.max_concurrent": 8` and a nested
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `limits.max_concurrent` | 8 | Global cap across every pool at once |
+| `limits.serial_light` | false | `false`: jobs in the `light` pool ignore the worktree serial key (they neither wait on a busy key nor mark it busy, even with an explicit `--serial-key`). `true`: light jobs obey the key like any other job. Env `AJQ_SERIAL_LIGHT` |
 | `limits.pools.<tier>` | heavy 2 / normal 4 / service 3 / light 6 | Per-tier concurrency cap |
 | `defaults.timeout_s` | 1800 | SIGTERM the job after this many seconds, SIGKILL after `kill_grace_s` |
 | `defaults.max_output_bytes` | 8388608 (8 MiB) | Truncate and stop the job past this |
@@ -401,7 +402,9 @@ Rules:
   the RAM the box has is a burst the kernel OOM-kills, and those jobs end
   `failed` with `kill_reason memory_limit`.
 - The worktree serial key is the one gate a forced start keeps, because two jobs
-  in one checkout write the same `target/`, `.next/` and lockfiles. Use
+  in one checkout write the same `target/`, `.next/` and lockfiles.
+  Jobs in the `light` pool skip the gate unless `limits.serial_light` is `true`,
+  so they are never counted as blocked. Use
   `--ignore-serial` to override that too; the prompt then reports zero blocked
   rows, and when every queued job is serial-blocked the command prints
   `nothing to start: every queued job shares a worktree with another

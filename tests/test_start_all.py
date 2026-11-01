@@ -115,6 +115,29 @@ class TestStartAllPlan(helpers.AjqTestCase):
         self.assertEqual(ignored["startable"], 1)
         self.assertTrue(ignored["ignore_serial"])
 
+    def test_a_light_job_on_a_busy_key_is_not_counted_as_blocked(self):
+        scheduler, _ = make_scheduler(self, limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}})
+        first = scheduler.submit(argv=SLEEP, cwd=self.state_dir, kind="build", pool="heavy")
+        self.assertEqual(scheduler.tick(), [first["id"]])
+        wait_for_state(scheduler, first["id"], {"running"})
+        light = scheduler.submit(argv=SLEEP, cwd=self.state_dir, kind="lint", pool="light")
+        self.assertEqual(first["serial_key"], light["serial_key"])
+        plan = scheduler.start_all_plan()
+        self.assertEqual(plan["blocked_by_serial"], 0)
+        self.assertEqual([row["id"] for row in plan["jobs"]], [light["id"]])
+
+    def test_serial_light_true_counts_a_light_job_on_a_busy_key_as_blocked(self):
+        scheduler, _ = make_scheduler(
+            self, limits={"max_concurrent": 8, "serial_light": True, "pools": {"heavy": 8, "light": 8}}
+        )
+        first = scheduler.submit(argv=SLEEP, cwd=self.state_dir, kind="build", pool="heavy")
+        self.assertEqual(scheduler.tick(), [first["id"]])
+        wait_for_state(scheduler, first["id"], {"running"})
+        scheduler.submit(argv=SLEEP, cwd=self.state_dir, kind="lint", pool="light")
+        plan = scheduler.start_all_plan()
+        self.assertEqual(plan["blocked_by_serial"], 1)
+        self.assertEqual(plan["startable"], 0)
+
     def test_an_empty_queue_plans_nothing(self):
         scheduler, _ = make_scheduler(self)
         plan = scheduler.start_all_plan()

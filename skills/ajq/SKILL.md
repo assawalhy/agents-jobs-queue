@@ -97,7 +97,7 @@ What to do per state:
 
 Jobs are serialized per git worktree (`serial_key=auto` resolves
 `git rev-parse --show-toplevel`), so two agents in one worktree never overlap and
-never fight over `target/`, `.next/`, or a lockfile. Different worktrees run in
+never fight over `target/`, `.next/`, or a lockfile. Jobs in the light pool skip that gate (`limits.serial_light: true` restores it). Different worktrees run in
 parallel up to the pool caps (`limits.pools`, `limits.max_concurrent`). Admission
 also waits for available memory, so a busy machine delays jobs instead of
 thrashing.
