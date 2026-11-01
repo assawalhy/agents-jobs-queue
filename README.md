@@ -69,7 +69,7 @@ flowchart LR
 ## 🧠 Good to know
 
 - 🧱 **Concurrency is pooled**: `heavy 2 · normal 4 · service 3 · light 6`, global cap 8. A cheap lint never queues behind a Gradle build. `ajq start` overrides all of it for the queued backlog, after printing the memory and CPU it will reserve.
-- 🌳 **Serialized per git worktree** by default, so two agents in one checkout never run overlapping commands. `--serial-key none` opts out.
+- 🌳 **Serialized per git worktree** by default, so two agents in one checkout never run overlapping commands. `--serial-key none` opts out. Jobs in the `light` pool skip the gate by default, and `limits.serial_light: true` restores it.
 - 🧠 **Estimates come from a real cache**: Welford mean + 0.5σ over `kind|tool|dirs|filecount`, cold-starting from per-kind defaults. `ajq stats` prints MAPE so the accuracy is checkable.
 - 🪟 **macOS cannot hard-cap a job's RAM** — no cgroup write access, and `RLIMIT_AS` breaks Node/JVM/Docker. The free-RAM admission gate does the work there and `ajq doctor` says so.
 - ⚠️ The guard defaults to `warn` (it tells the agent, it does not block). On Claude/Codex/Kiro that is a note injected before the call; on OpenCode V2 it is a note appended to the tool result. Set `hooks.guard_mode` to `block` to deny heavy commands outright.

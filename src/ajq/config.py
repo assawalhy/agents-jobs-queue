@@ -19,6 +19,7 @@ from ajq import paths
 DEFAULTS: dict = {
     "limits": {
         "max_concurrent": 8,
+        "serial_light": False,
         "pools": {"heavy": 2, "normal": 4, "service": 3, "light": 6},
     },
     "defaults": {
@@ -68,6 +69,7 @@ DEFAULTS: dict = {
 # (env var, dotted key path, value kind)
 ENV_KEYS: tuple[tuple[str, str, str], ...] = (
     ("AJQ_MAX_CONCURRENT", "limits.max_concurrent", "int"),
+    ("AJQ_SERIAL_LIGHT", "limits.serial_light", "bool"),
     ("AJQ_POOL", "defaults.pool", "str"),
     ("AJQ_TIMEOUT_S", "defaults.timeout_s", "int"),
     ("AJQ_MAX_OUTPUT_BYTES", "defaults.max_output_bytes", "int"),
@@ -82,7 +84,7 @@ ENV_KEYS: tuple[tuple[str, str, str], ...] = (
 )
 
 _DOC: dict[str, str] = {
-    "limits": "max_concurrent caps every pool at once; pools.* caps one tier each.",
+    "limits": "max_concurrent caps every pool at once; pools.* caps one tier each; serial_light true makes light-pool jobs obey the worktree serial_key gate (false: they skip it).",
     "defaults": "Per-job fallbacks used when the matching submit flag is absent.",
     "resources": "Enforcement handed to the exec backend; pool_memory_mb is one tier's soft cap and reservation, hard_factor sets the kill ceiling, swap_credit counts free zram toward admission, admission.* holds new jobs under pressure.",
     "estimates": "Welford duration cache; light_threshold_s promotes cheap jobs to the light pool.",
@@ -206,6 +208,15 @@ def env_overrides() -> dict:
                 value = float(text)
             except ValueError:
                 _warn_once(var, f"ignoring {var}={raw!r}: not a number")
+                continue
+        elif kind == "bool":
+            lowered = text.lower()
+            if lowered in ("1", "true", "yes", "on"):
+                value = True
+            elif lowered in ("0", "false", "no", "off"):
+                value = False
+            else:
+                _warn_once(var, f"ignoring {var}={raw!r}: not a boolean")
                 continue
         else:
             value = text

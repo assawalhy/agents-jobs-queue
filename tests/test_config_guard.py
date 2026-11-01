@@ -92,6 +92,17 @@ class TestConfig(helpers.AjqTestCase):
             got = ajq_config.load_config(path=None).get(dotted)
             self.assertEqual(str(got), value, f"{name} -> {dotted} was {got!r}")
 
+    def test_serial_light_defaults_to_false(self):
+        self.assertIs(ajq_config.load_config(path=None).get("limits.serial_light"), False)
+
+    def test_serial_light_env_override_parses_booleans(self):
+        self.addCleanup(os.environ.pop, "AJQ_SERIAL_LIGHT", None)
+        for text, expected in (("1", True), ("TRUE", True), ("yes", True), ("on", True),
+                               ("0", False), ("False", False), ("no", False), ("OFF", False)):
+            os.environ["AJQ_SERIAL_LIGHT"] = text
+            got = ajq_config.load_config(path=None).get("limits.serial_light")
+            self.assertIs(got, expected, f"{text!r} -> {got!r}")
+
 
 class TestGuard(unittest.TestCase):
     def test_heavy_commands_land_in_heavy_pool(self):

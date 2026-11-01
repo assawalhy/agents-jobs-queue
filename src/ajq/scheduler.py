@@ -268,7 +268,7 @@ class Scheduler:
             tier = str(job.get("pool") or "normal")
             counts[tier] = counts.get(tier, 0) + 1
             key = str(job.get("serial_key") or "")
-            if key:
+            if key and not self._serial_exempt(job):
                 busy.add(key)
         memory_hold, cpu_hold = self.pressure()
         return {
@@ -279,6 +279,11 @@ class Scheduler:
             "memory_hold": memory_hold,
             "cpu_hold": cpu_hold,
         }
+
+    def _serial_exempt(self, job: dict) -> bool:
+        if str(job.get("pool") or "normal") != "light":
+            return False
+        return not bool(self.config.get("limits.serial_light", False))
 
     def _hold(self, job: dict, state: dict) -> str:
         """Why `job` cannot start against `state` right now; "" when it can."""
@@ -292,7 +297,7 @@ class Scheduler:
         if state["counts"].get(tier, 0) >= cap:
             return f"pool {tier} {state['counts'].get(tier, 0)}/{cap}"
         key = str(job.get("serial_key") or "")
-        if key and key in state["busy"]:
+        if key and key in state["busy"] and not self._serial_exempt(job):
             return "serial_key busy"
         # Progress rule: with nothing running, no reservation or pressure reading may
         # keep the head job queued, or memory held by other programs (or stall from
@@ -325,7 +330,7 @@ class Scheduler:
             state["running"] += 1
             state["counts"][tier] = state["counts"].get(tier, 0) + 1
             key = str(job.get("serial_key") or "")
-            if key:
+            if key and not self._serial_exempt(job):
                 state["busy"].add(key)
             state["free"] -= max(0, self._memory_for(job))
         return started
@@ -434,6 +439,9 @@ class Scheduler:
         blocked = 0
         for job in queued:
             key = str(job.get("serial_key") or "")
+            if self._serial_exempt(job):
+                startable.append(job)
+                continue
             if key and not ignore_serial and key in busy:
                 blocked += 1
                 continue
@@ -446,7 +454,7 @@ class Scheduler:
         return {
             str(job.get("serial_key"))
             for job in self.store.running_jobs()
-            if job.get("serial_key")
+            if job.get("serial_key") and not self._serial_exempt(job)
         }
 
     def _plan_of(

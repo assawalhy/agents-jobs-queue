@@ -140,6 +140,46 @@ class TestScheduling(helpers.AjqTestCase):
                   second["id"]: store.get(second["id"])["state"]}
         self.assertEqual(sorted(states.values()), ["queued", "running"])
 
+    def test_light_job_starts_beside_a_running_heavy_job_in_the_same_worktree(self):
+        scheduler, store = make_scheduler(self, limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}})
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [heavy["id"]])
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [light["id"]])
+        self.assertEqual(store.get(light["id"])["state"], "running")
+
+    def test_two_heavy_jobs_with_one_serial_key_still_run_one_at_a_time(self):
+        scheduler, store = make_scheduler(self, limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}})
+        first = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="wt-a")
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [first["id"]])
+        self.assertEqual(store.get(second["id"])["state"], "queued")
+        self.assertEqual(scheduler.enrich(store.get(second["id"]))["blocked"], "serial_key busy")
+
+    def test_running_light_job_does_not_block_a_heavy_job_with_the_same_key(self):
+        scheduler, store = make_scheduler(self, limits={"max_concurrent": 8, "pools": {"heavy": 8, "light": 8}})
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [light["id"]])
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [heavy["id"]])
+
+    def test_two_light_jobs_with_one_serial_key_start_together(self):
+        scheduler, _ = make_scheduler(self, limits={"max_concurrent": 8, "pools": {"light": 8}})
+        first = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="wt-a")
+        second = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [first["id"], second["id"]])
+
+    def test_serial_light_true_makes_a_light_job_wait_for_the_key(self):
+        scheduler, store = make_scheduler(
+            self, limits={"max_concurrent": 8, "serial_light": True, "pools": {"heavy": 8, "light": 8}}
+        )
+        heavy = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="build", pool="heavy", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [heavy["id"]])
+        light = scheduler.submit(argv=SHORT, cwd=self.state_dir, kind="lint", pool="light", serial_key="wt-a")
+        self.assertEqual(scheduler.tick(), [])
+        self.assertEqual(store.get(light["id"])["state"], "queued")
+        self.assertEqual(scheduler.enrich(store.get(light["id"]))["blocked"], "serial_key busy")
+
     def test_memory_admission_blocks_when_box_is_full(self):
         scheduler, store = make_scheduler(
             self,
